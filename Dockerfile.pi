@@ -1,0 +1,43 @@
+FROM node:24-slim
+
+# Install system utilities commonly needed by coding agents
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    ripgrep \
+    build-essential \
+    zsh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Oh-My-Zsh (unattended)
+RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+
+# Set UTF-8 locale so Unicode characters (e.g., λ in the prompt) render correctly
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+# Fix backspace key (sets erase char to DEL \177)
+RUN echo 'bindkey "\e[3~" delete-char' >> /root/.zshrc && \
+    echo 'stty erase "\177"' >> /root/.zshrc
+
+# Install uv (Python package manager)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Install Python via uv and expose as `python` on the system path
+RUN uv python install && ln -s $(uv python find 3.14 || uv python find 3.13 || uv python find 3.12) /usr/local/bin/python
+
+# Install DuckDB CLI
+RUN curl https://install.duckdb.org | sh
+
+# Install the Pi coding agent globally
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+
+# Set up the workspace mount point inside the VM
+WORKDIR /workspace
+
+# Allow git to operate on the mounted workspace (owned by host user, not root)
+RUN git config --global --add safe.directory /workspace
+
+# Entrypoint directly boots the Pi harness
+ENTRYPOINT ["zsh", "-l"]
