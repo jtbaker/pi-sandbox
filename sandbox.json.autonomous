@@ -1,6 +1,7 @@
 {
   "permissionPromptTimeoutSeconds": 10,
   "filesystem": {
+    "allowWrite": [".", "/tmp", "/root/.npm", "/root/.cache", "/root/.local/share", "/root/.config"],
     "denyRead": ["/root/.pi-agent"],
     "denyWrite": [".env", ".env.*", "*.pem", "*.key"]
   }
