@@ -1,12 +1,15 @@
 FROM node:24-slim
 
 # Install system utilities commonly needed by coding agents
+# bubblewrap + socat are required by the pi-sandbox extension for in-VM sandboxing
 RUN apt-get update && apt-get install -y \
     git \
     curl \
     ripgrep \
     build-essential \
     zsh \
+    bubblewrap \
+    socat \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Oh-My-Zsh (unattended)
@@ -15,6 +18,10 @@ RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master
 # Set UTF-8 locale so Unicode characters (e.g., λ in the prompt) render correctly
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
+
+# TERM is not inherited through the smolvm microVM console; default to xterm-256color
+# so zsh's line editor (zle), terminfo key bindings, and TUI apps work in the container
+ENV TERM=xterm-256color
 
 # Fix backspace key (sets erase char to DEL \177)
 RUN echo 'bindkey "\e[3~" delete-char' >> /root/.zshrc && \
@@ -30,8 +37,8 @@ RUN uv python install && ln -s $(uv python find 3.14 || uv python find 3.13 || u
 # Install DuckDB CLI
 RUN curl https://install.duckdb.org | sh
 
-# Install the Pi coding agent globally
-RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+# Install the Pi coding agent globally (pin to a known-good release)
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1
 
 # Set up the workspace mount point inside the VM
 WORKDIR /workspace

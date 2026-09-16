@@ -101,6 +101,8 @@ fi
 smolvm machine run -it \
     --net \
     --ssh-agent \
+    --mem 2048 \
+    --cpus 4 \
     -v "$TARGET_DIR:/workspace" \
     -v "$HOST_PI_DIR:/root/.pi" \
     -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
