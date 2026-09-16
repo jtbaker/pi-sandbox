@@ -45,7 +45,9 @@ fi
 
 echo "Mounting host directory: $TARGET_DIR"
 
-# Ensure ~/.pi exists on host to persist login state, themes, and templates
+# Ensure ~/.pi exists on host. It is mounted read-only into the VM and seeded
+# into an ephemeral VM-local agent dir at boot (see pi-agent-seed.sh in the
+# image), so VM runs get host login state/extensions without sharing files.
 HOST_PI_DIR="$HOME/.pi"
 mkdir -p "$HOST_PI_DIR"
 mkdir -p "$CACHE_DIR"
@@ -104,7 +106,7 @@ smolvm machine run -it \
     --mem 2048 \
     --cpus 4 \
     -v "$TARGET_DIR:/workspace" \
-    -v "$HOST_PI_DIR:/root/.pi" \
+    -v "$HOST_PI_DIR:/root/.pi-host:ro" \
     -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
     -e OPENAI_API_KEY="${OPENAI_API_KEY:-}" \
     -e OPENAI_BASE_URL="${VM_LLM_URL:-}" \

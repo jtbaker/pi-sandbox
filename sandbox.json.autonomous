@@ -1,0 +1,7 @@
+{
+  "permissionPromptTimeoutSeconds": 10,
+  "filesystem": {
+    "denyRead": ["/root/.pi-agent"],
+    "denyWrite": [".env", ".env.*", "*.pem", "*.key"]
+  }
+}

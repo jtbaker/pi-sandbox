@@ -12,6 +12,23 @@ RUN apt-get update && apt-get install -y \
     socat \
     && rm -rf /var/lib/apt/lists/*
 
+# --- Autonomous agent environment ------------------------------------------------
+# The host's ~/.pi is mounted read-only at /root/.pi-host (see pi-sandbox.sh).
+# pi-agent-seed.sh copies it into an ephemeral VM-local agent dir
+# (PI_CODING_AGENT_DIR) and installs the autonomous sandbox profile, so VM
+# runs never share or modify the host's ~/.pi. It runs from /root/.zshenv
+# (every zsh invocation, login or not — smolvm boots a non-login shell) and
+# is a fast no-op after the first run of the boot.
+COPY pi-agent-seed.sh /usr/local/bin/pi-agent-seed.sh
+COPY sandbox.json.autonomous /opt/pi-sandbox/sandbox.json.autonomous
+RUN chmod +x /usr/local/bin/pi-agent-seed.sh
+ENV PI_CODING_AGENT_DIR=/root/.pi-agent
+# Seed on every zsh start (marker in the seed script makes repeats free)
+RUN printf '%s\n' \
+    '# Seed the ephemeral agent dir from the host copy (see pi-agent-seed.sh)' \
+    '[ -x /usr/local/bin/pi-agent-seed.sh ] && /usr/local/bin/pi-agent-seed.sh' \
+    > /root/.zshenv
+
 # Install Oh-My-Zsh (unattended)
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
 
