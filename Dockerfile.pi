@@ -1,4 +1,5 @@
 FROM node:24-slim
+LABEL io.pi-sandbox.config-layout="separate-v2"
 
 # Install system utilities commonly needed by coding agents
 # bubblewrap + socat are required by the pi-sandbox extension for in-VM sandboxing
@@ -8,27 +9,22 @@ RUN apt-get update && apt-get install -y \
     ripgrep \
     build-essential \
     zsh \
+    python3 \
+    iproute2 \
+    nftables \
+    util-linux \
     bubblewrap \
     socat \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Autonomous agent environment ------------------------------------------------
-# The host's ~/.pi and ~/.omp are mounted read-only at /root/.pi-host and
-# /root/.omp-host (see pi-sandbox.sh).
-# pi-agent-seed.sh copies it into an ephemeral VM-local agent dir
-# (PI_CODING_AGENT_DIR) and installs the autonomous sandbox profile, so VM
-# runs never share or modify the host's ~/.pi. It runs from /root/.zshenv
-# (every zsh invocation, login or not — smolvm boots a non-login shell) and
-# is a fast no-op after the first run of the boot.
-COPY pi-agent-seed.sh /usr/local/bin/pi-agent-seed.sh
+# Host configuration is read-only; each agent receives its own private snapshot.
+# Seed once at the entrypoint, before any shell or agent can access the copies.
+COPY pi-agent-seed.py /usr/local/bin/pi-agent-seed.py
+COPY pi-network-policy.py /usr/local/bin/pi-network-policy.py
+COPY sandbox-network.json /opt/pi-sandbox/network.json
 COPY sandbox.json.autonomous /opt/pi-sandbox/sandbox.json.autonomous
-RUN chmod +x /usr/local/bin/pi-agent-seed.sh
-ENV PI_CODING_AGENT_DIR=/root/.pi-agent
-# Seed on every zsh start (marker in the seed script makes repeats free)
-RUN printf '%s\n' \
-    '# Seed the ephemeral agent dir from the host copy (see pi-agent-seed.sh)' \
-    '[ -x /usr/local/bin/pi-agent-seed.sh ] && /usr/local/bin/pi-agent-seed.sh' \
-    > /root/.zshenv
+RUN chmod +x /usr/local/bin/pi-agent-seed.py /usr/local/bin/pi-network-policy.py
 
 # Install Oh-My-Zsh (unattended)
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
@@ -62,8 +58,8 @@ RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1
 # release, like the pi pin above). omp has a native Rust core; the official
 # installer's --binary --ref mode fetches the prebuilt release binary for the
 # target platform (linux/amd64 + linux/arm64 here) and verifies its sha256.
-# omp reads its agent dir from PI_CODING_AGENT_DIR (seeded from the host's
-# ~/.omp/agent by pi-agent-seed.sh), the same env var pi uses.
+# omp uses /root/.omp/agent; Pi uses /root/.pi/agent. Do not set the shared
+# PI_CODING_AGENT_DIR override, which would merge their configuration.
 RUN curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v18.12.6
 
 # Set up the workspace mount point inside the VM
@@ -72,5 +68,6 @@ WORKDIR /workspace
 # Allow git to operate on the mounted workspace (owned by host user, not root)
 RUN git config --global --add safe.directory /workspace
 
-# Entrypoint directly boots the Pi harness
-ENTRYPOINT ["zsh", "-l"]
+# Start an interactive shell only after configuration seeding succeeds.
+ENTRYPOINT ["/usr/local/bin/pi-agent-seed.py"]
+CMD ["zsh", "-l"]

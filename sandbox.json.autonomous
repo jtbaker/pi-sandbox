@@ -2,7 +2,7 @@
   "permissionPromptTimeoutSeconds": 10,
   "filesystem": {
     "allowWrite": [".", "/tmp", "/root/.npm", "/root/.cache", "/root/.local/share", "/root/.config"],
-    "denyRead": ["/root/.pi-agent"],
+    "denyRead": ["/root/.pi", "/root/.omp", "/root/.pi-host", "/root/.omp-host"],
     "denyWrite": [".env", ".env.*", "*.pem", "*.key"]
   }
 }
