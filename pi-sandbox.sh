@@ -2,166 +2,439 @@
 
 set -euo pipefail
 
-CACHE_DIR="$HOME/.cache/pi-sandbox"
-IMAGE_TAR="$CACHE_DIR/pi-sandbox.tar"
-IMAGE_NAME="jasonbaker/pi-sandbox:latest"
-AGENT_ARG=""
+IMAGE_NAME="${PI_SANDBOX_IMAGE-jasonbaker/pi-sandbox:latest}"
+AGENT="${AGENT-pi}"
+SSH_AGENT=false
+DNS_SERVER=""
+TARGET_SET=false
 
-# Parse flags and arguments
+# Validate all user-controlled launch settings before Docker or VM activity.
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
             echo "Usage: pi-sandbox [options] [target_directory]"
-            echo "Runs the pi.dev (or omp / oh-my-pi) coding agent inside a secure smolvm microVM sandbox."
+            echo "Starts an interactive login shell inside an ephemeral smolvm microVM."
+            echo "Pi and omp sessions/attachments share normal host history and survive VM exit."
+            echo "Do not edit the same session from multiple host/VM processes at once."
             echo ""
             echo "Options:"
-            echo "  --agent NAME        Agent to run in the VM: pi (default) or omp (oh-my-pi)."
-            echo "                      Equivalent to AGENT=omp ./pi-sandbox.sh"
+            echo "  --agent NAME        Startup hint: pi (default) or omp; does not launch it."
+            echo "  --ssh-agent         Opt in to forwarding the socket in SSH_AUTH_SOCK."
+            echo "  --dns IP            Guest DNS resolver (e.g. 100.100.100.100 for MagicDNS)."
             echo "  -h, --help          Show this help message"
             echo ""
             echo "Environment Variables:"
-            echo "  AGENT               Agent to run: pi (default) or omp (--agent overrides)."
-            echo "  LLM_BASE_URL        Custom LLM endpoint (e.g. http://localhost:8001/v1 for OMLX)"
-            echo "                      When set, cloud API keys are not forwarded."
-            echo "  ANTHROPIC_API_KEY   Anthropic API key (ignored if LLM_BASE_URL is set)"
-            echo "  OPENAI_API_KEY      OpenAI API key (ignored if LLM_BASE_URL is set)"
+            echo "  AGENT               Startup hint: pi or omp (--agent overrides)."
+            echo "  PI_SANDBOX_IMAGE    Use an existing local image instead of pulling latest."
+            echo "                      Export fallback may fetch its immutable registry digest."
+            echo "  LLM_BASE_URL        Custom endpoint; disables cloud API key forwarding."
+            echo "  ANTHROPIC_API_KEY   Forwarded only when LLM_BASE_URL is empty."
+            echo "  OPENAI_API_KEY      Forwarded only when LLM_BASE_URL is empty."
+            echo "  SSH_AUTH_SOCK       Socket forwarded only with --ssh-agent."
             echo ""
-            echo "Building and pushing the image (first time or after Dockerfile changes):"
-            echo "  ./build.sh"
+            echo "Requires smolvm with privileged init/--no-init-cache, Docker, and realpath."
             exit 0
             ;;
         --agent)
-            AGENT_ARG="${2:-}"
-            if [[ "$AGENT_ARG" != "pi" && "$AGENT_ARG" != "omp" ]]; then
-                echo "Error: --agent must be 'pi' or 'omp'."
+            if [[ $# -lt 2 || ( "$2" != pi && "$2" != omp ) ]]; then
+                echo "Error: --agent must be 'pi' or 'omp'." >&2
                 exit 1
             fi
+            AGENT="$2"
             shift 2
             ;;
+        --ssh-agent)
+            SSH_AGENT=true
+            shift
+            ;;
+        --dns)
+            if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+                echo "Error: --dns requires a resolver IP address." >&2
+                exit 1
+            fi
+            DNS_SERVER="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            if [[ $# -gt 1 || ( $# -eq 1 && "$TARGET_SET" == true ) ]]; then
+                echo "Error: only one target directory is allowed." >&2
+                exit 1
+            fi
+            if [[ $# -eq 1 ]]; then
+                TARGET_ARG="$1"
+                TARGET_SET=true
+                shift
+            fi
+            ;;
         -*)
-            echo "Error: unknown option: $1"
-            echo "Run 'pi-sandbox --help' for usage."
+            echo "Error: unknown option: $1" >&2
             exit 1
             ;;
         *)
+            if [[ "$TARGET_SET" == true ]]; then
+                echo "Error: only one target directory is allowed." >&2
+                exit 1
+            fi
             TARGET_ARG="$1"
+            TARGET_SET=true
             shift
             ;;
     esac
 done
 
-# Resolve target directory with fallback to current working directory
-TARGET_PATH="${TARGET_ARG:-$(pwd)}"
-TARGET_DIR=$(realpath "$TARGET_PATH" 2>/dev/null || echo "$TARGET_PATH")
-
-# Safety fallback if TARGET_DIR is somehow still empty
-if [[ -z "${TARGET_DIR:-}" ]]; then
-    TARGET_DIR="$(pwd)"
+if [[ "$AGENT" != pi && "$AGENT" != omp ]]; then
+    echo "Error: AGENT must be 'pi' or 'omp'." >&2
+    exit 1
 fi
-
-echo "Mounting host directory: $TARGET_DIR"
-
-# Ensure ~/.pi exists on host. It is mounted read-only into the VM and seeded
-# into an ephemeral VM-local agent dir at boot (see pi-agent-seed.sh in the
-# image), so VM runs get host login state/extensions without sharing files.
-HOST_PI_DIR="$HOME/.pi"
-HOST_OMP_DIR="$HOME/.omp"
-mkdir -p "$HOST_PI_DIR" "$HOST_OMP_DIR"
-mkdir -p "$CACHE_DIR"
-
-# Ensure smolvm is installed
-if ! command -v smolvm &> /dev/null; then
-    echo "Error: smolvm CLI not found."
-    echo "Install it via: curl -sSL https://smolmachines.com/install.sh | bash"
+if [[ ! "$IMAGE_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/@:-]*$ ]]; then
+    echo "Error: PI_SANDBOX_IMAGE must be a nonempty Docker image reference." >&2
+    exit 1
+fi
+if ! command -v realpath >/dev/null 2>&1; then
+    echo "Error: realpath is required to validate host mounts." >&2
     exit 1
 fi
 
-IMAGE_ID_FILE="$CACHE_DIR/.image_id"
-docker pull "$IMAGE_NAME"
+# Reject separators both before and after canonicalization: command substitution
+# strips trailing newlines, and symlinks can introduce otherwise hidden paths.
+validate_mount_path() {
+    if [[ -z "$1" || "$1" == *:* || "$1" == *$'\n'* || "$1" == *$'\r'* ]]; then
+        echo "Error: mount paths must be nonempty and contain no colons or newlines." >&2
+        exit 1
+    fi
+}
 
-# Cache validity keys on the exported tar's content hash: a plain image-id
-# check can't work because `docker inspect .Id` is the manifest-list digest
-# and stays identical across pulls of a new push, so stale tars would be
-# served forever. The hash check catches a fresh push; the size floor catches
-# an index-only tar — what `docker save` of a multi-arch tag writes in a
-# containerd store (OrbStack, Docker Desktop): index metadata, no layer
-# blobs (~20KB vs hundreds of MB). That is the tar smolvm rejects at boot
-# with "file not found in tar"; rejecting it here turns that mystery boot
-# error into an automatic re-export.
+TARGET_PATH="${TARGET_ARG-.}"
+validate_mount_path "$TARGET_PATH"
+validate_mount_path "${HOME:-}"
+# A sentinel preserves trailing newlines in realpath's result for validation.
+if ! TARGET_RESULT=$(realpath -- "$TARGET_PATH" && printf '.'); then
+    echo "Error: could not canonicalize the workspace directory." >&2
+    exit 1
+fi
+TARGET_DIR="${TARGET_RESULT%$'\n'.}"
+if ! HOME_RESULT=$(realpath -- "$HOME" && printf '.'); then
+    echo "Error: could not canonicalize HOME." >&2
+    exit 1
+fi
+HOST_HOME="${HOME_RESULT%$'\n'.}"
+validate_mount_path "$TARGET_DIR"
+validate_mount_path "$HOST_HOME"
+if [[ ! -d "$TARGET_DIR" || ! -d "$HOST_HOME" ]]; then
+    echo "Error: workspace and HOME must be existing directories." >&2
+    exit 1
+fi
+
+HOST_PI_DIR="${HOST_HOME%/}/.pi"
+HOST_OMP_DIR="${HOST_HOME%/}/.omp"
+for CONFIG in "$HOST_PI_DIR" "$HOST_OMP_DIR"; do
+    if [[ -e "$CONFIG" || -L "$CONFIG" ]]; then
+        if ! CONFIG_RESULT=$(realpath -- "$CONFIG" && printf '.'); then
+            echo "Error: could not canonicalize a host agent config directory." >&2
+            exit 1
+        fi
+        CONFIG_DIR="${CONFIG_RESULT%$'\n'.}"
+        validate_mount_path "$CONFIG_DIR"
+        if [[ ! -d "$CONFIG_DIR" ]]; then
+            echo "Error: host agent config paths must resolve to directories." >&2
+            exit 1
+        fi
+    else
+        CONFIG_DIR="$CONFIG"
+    fi
+    if [[ "$CONFIG" == "$HOST_PI_DIR" ]]; then
+        CANONICAL_PI_DIR="$CONFIG_DIR"
+    else
+        CANONICAL_OMP_DIR="$CONFIG_DIR"
+    fi
+    if [[ "$TARGET_DIR" == "$CONFIG_DIR" || "$TARGET_DIR" == / || "$CONFIG_DIR" == / ||
+          "$TARGET_DIR" == "$CONFIG_DIR/"* || "$CONFIG_DIR" == "$TARGET_DIR/"* ]]; then
+        echo "Error: workspace must not overlap host .pi or .omp config directories." >&2
+        exit 1
+    fi
+done
+if [[ "$TARGET_DIR" == "$HOST_HOME" || "$HOST_HOME" == "$TARGET_DIR/"* ]]; then
+    echo "Error: workspace must not be HOME or one of its ancestors." >&2
+    exit 1
+fi
+HOST_PI_DIR="$CANONICAL_PI_DIR"
+HOST_OMP_DIR="$CANONICAL_OMP_DIR"
+
+# Mirror native path identities without mounting HOME or the host temporary tree.
+HOST_TMP_PATH="${TMPDIR:-/tmp}"
+validate_mount_path "$HOST_TMP_PATH"
+if ! TMP_RESULT=$(realpath -- "$HOST_TMP_PATH" && printf '.'); then
+    echo "Error: could not canonicalize TMPDIR." >&2
+    exit 1
+fi
+HOST_TMPDIR="${TMP_RESULT%$'\n'.}"
+validate_mount_path "$HOST_TMPDIR"
+if [[ ! -d "$HOST_TMPDIR" ]]; then
+    echo "Error: TMPDIR must be an existing directory." >&2
+    exit 1
+fi
+WORKSPACE_ALIAS=""
+if [[ "$TARGET_DIR" == /private/tmp/* ]]; then
+    ALIAS_PATH="${TARGET_DIR#/private}"
+    if ALIAS_RESULT=$(realpath -- "$ALIAS_PATH" 2>/dev/null && printf '.'); then
+        ALIAS_DIR="${ALIAS_RESULT%$'\n'.}"
+        validate_mount_path "$ALIAS_DIR"
+        if [[ "$ALIAS_DIR" == "$TARGET_DIR" ]]; then
+            WORKSPACE_ALIAS="$ALIAS_PATH"
+        fi
+    fi
+fi
+
+# Each writable state source has only real directory components beneath the
+# canonical config root. Never follow an agent/session/blob/profile symlink into
+# credentials or configuration, and never change existing state permissions.
+ensure_state_directory() {
+    local path="$1" result canonical
+    validate_mount_path "$path"
+    if [[ -L "$path" || ( -e "$path" && ! -d "$path" ) ]]; then
+        echo "Error: shared state paths must be real directories, not symlinks: $path" >&2
+        exit 1
+    fi
+    if [[ ! -d "$path" ]]; then
+        (umask 077; mkdir -m 700 -- "$path")
+    fi
+    if ! result=$(realpath -- "$path" && printf '.'); then
+        echo "Error: could not canonicalize shared state directory: $path" >&2
+        exit 1
+    fi
+    canonical="${result%$'\n'.}"
+    validate_mount_path "$canonical"
+    if [[ "$canonical" != "$path" ]]; then
+        echo "Error: shared state directory has an aliased parent: $path" >&2
+        exit 1
+    fi
+}
+
+STATE_MOUNTS=()
+add_agent_state() {
+    local source="$1" destination="$2" blobs="$3"
+    ensure_state_directory "$source"
+    ensure_state_directory "$source/sessions"
+    STATE_MOUNTS+=(-v "$source/sessions:$destination/sessions")
+    if [[ "$blobs" == true ]]; then
+        ensure_state_directory "$source/blobs"
+        STATE_MOUNTS+=(-v "$source/blobs:$destination/blobs")
+    fi
+}
+
+ensure_state_directory "$HOST_PI_DIR"
+ensure_state_directory "$HOST_OMP_DIR"
+add_agent_state "$HOST_PI_DIR/agent" "${HOST_HOME%/}/.pi/agent" false
+add_agent_state "$HOST_OMP_DIR/agent" "${HOST_HOME%/}/.omp/agent" true
+PROFILES_DIR="$HOST_OMP_DIR/profiles"
+if [[ -e "$PROFILES_DIR" || -L "$PROFILES_DIR" ]]; then
+    ensure_state_directory "$PROFILES_DIR"
+    for PROFILE_DIR in "$PROFILES_DIR"/* "$PROFILES_DIR"/.[!.]* "$PROFILES_DIR"/..?*; do
+        [[ -e "$PROFILE_DIR" || -L "$PROFILE_DIR" ]] || continue
+        [[ -d "$PROFILE_DIR" || -L "$PROFILE_DIR" ]] || continue
+        PROFILE_NAME="${PROFILE_DIR##*/}"
+        if [[ ! "$PROFILE_NAME" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ||
+              "$PROFILE_NAME" == *. || "$PROFILE_NAME" == default ||
+              "$PROFILE_NAME" =~ ^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$ ]]; then
+            echo "Error: invalid omp profile directory name: $PROFILE_NAME" >&2
+            exit 1
+        fi
+        ensure_state_directory "$PROFILE_DIR"
+        add_agent_state "$PROFILE_DIR/agent" \
+            "${HOST_HOME%/}/.omp/profiles/$PROFILE_NAME/agent" true
+    done
+fi
+
+SCRIPT_PATH=$(realpath -- "${BASH_SOURCE[0]}")
+REPO_DIR="${SCRIPT_PATH%/*}"
+SMOLFILE="$REPO_DIR/pi-sandbox.smolfile"
+if [[ ! -f "$SMOLFILE" ]]; then
+    echo "Error: pi-sandbox.smolfile must be beside the launcher for trusted network initialization." >&2
+    exit 1
+fi
+SMOLVM_ARGS=(machine run -it --net --net-backend virtio-net --smolfile "$SMOLFILE" \
+    --no-init-cache --unprivileged --mem 2048 --cpus 4 \
+    --workdir "$TARGET_DIR" --env "HOME=$HOST_HOME" --env "TMPDIR=$HOST_TMPDIR" \
+    --env PI_SANDBOX_PERSIST_SESSIONS=1)
+if [[ -n "$WORKSPACE_ALIAS" ]]; then
+    SMOLVM_ARGS+=(--env "PI_SANDBOX_WORKSPACE_ALIAS=$WORKSPACE_ALIAS")
+fi
+if [[ -n "$DNS_SERVER" ]]; then
+    SMOLVM_ARGS+=(--dns "$DNS_SERVER")
+fi
+if [[ "$SSH_AGENT" == true ]]; then
+    if [[ -z "${SSH_AUTH_SOCK:-}" || ! -S "$SSH_AUTH_SOCK" ]]; then
+        echo "Error: --ssh-agent requires SSH_AUTH_SOCK to name an existing Unix socket." >&2
+        exit 1
+    fi
+    SMOLVM_ARGS+=(--ssh-agent)
+fi
+
+# Endpoints are passed unchanged; the kernel policy decides what is reachable.
+VM_LLM_URL="${LLM_BASE_URL:-}"
+if [[ -n "$VM_LLM_URL" ]]; then
+    echo "Using custom LLM endpoint; cloud API keys will not be forwarded."
+    export VM_LLM_URL
+    SMOLVM_ARGS+=(--secret-env OPENAI_BASE_URL=VM_LLM_URL --secret-env LLM_BASE_URL=VM_LLM_URL)
+else
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        SMOLVM_ARGS+=(--secret-env ANTHROPIC_API_KEY=ANTHROPIC_API_KEY)
+    fi
+    if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+        SMOLVM_ARGS+=(--secret-env OPENAI_API_KEY=OPENAI_API_KEY)
+    fi
+fi
+
+for TOOL in smolvm docker; do
+    if ! command -v "$TOOL" >/dev/null 2>&1; then
+        echo "Error: required command not found: $TOOL" >&2
+        exit 1
+    fi
+done
+
+CACHE_DIR="${HOST_HOME%/}/.cache/pi-sandbox"
+IMAGE_TAR="$CACHE_DIR/pi-sandbox.tar"
+IMAGE_ID_FILE="$CACHE_DIR/.image_id"
+mkdir -p "$CACHE_DIR"
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64) ARCH=amd64 ;;
+    aarch64|arm64) ARCH=arm64 ;;
+    *) echo "Error: unsupported host architecture: $ARCH" >&2; exit 1 ;;
+esac
+PLATFORM="linux/$ARCH"
+if [[ -n "${PI_SANDBOX_IMAGE+x}" ]]; then
+    echo "Using local image override (skipping docker pull): $IMAGE_NAME"
+else
+    docker pull --platform "$PLATFORM" "$IMAGE_NAME"
+fi
+# Reject images built for the old shared-directory/shell-seeder layout before
+# exporting or booting them. A fresh registry pull alone cannot update that code.
+LAYOUT_KEY="io.pi-sandbox.config-layout"
+LAYOUT_VERSION="separate-v3"
+if ! IMAGE_LAYOUT=$(docker image inspect --format "{{index .Config.Labels \"$LAYOUT_KEY\"}}" "$IMAGE_NAME"); then
+    echo "Error: image is unavailable locally; PI_SANDBOX_IMAGE requires an existing local image." >&2
+    exit 1
+fi
+if [[ "$IMAGE_LAYOUT" != "$LAYOUT_VERSION" ]]; then
+    if [[ -n "${PI_SANDBOX_IMAGE+x}" ]]; then
+        echo "Error: PI_SANDBOX_IMAGE lacks the current configuration seeder; rebuild it from Dockerfile.pi." >&2
+        exit 1
+    fi
+    if [[ ! -f "$REPO_DIR/Dockerfile.pi" || ! -f "$REPO_DIR/pi-agent-seed.py" ||
+          ! -f "$REPO_DIR/pi-network-policy.py" || ! -f "$REPO_DIR/sandbox-network.json" ||
+          ! -f "$REPO_DIR/sandbox.json.autonomous" ]]; then
+        echo "Error: published image is too old; matching image sources must be beside the launcher." >&2
+        exit 1
+    fi
+    IMAGE_NAME="pi-sandbox:config-local"
+    echo "Published image uses the old configuration layout; building the matching image locally (no push)."
+    docker buildx build --load --platform "$PLATFORM" -f "$REPO_DIR/Dockerfile.pi" \
+        -t "$IMAGE_NAME" "$REPO_DIR"
+    IMAGE_LAYOUT=$(docker image inspect --format "{{index .Config.Labels \"$LAYOUT_KEY\"}}" "$IMAGE_NAME")
+    if [[ "$IMAGE_LAYOUT" != "$LAYOUT_VERSION" ]]; then
+        echo "Error: locally built image has an incompatible configuration layout." >&2
+        exit 1
+    fi
+fi
+if ! IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME"); then
+    echo "Error: image is unavailable locally; PI_SANDBOX_IMAGE requires an existing local image." >&2
+    exit 1
+fi
+if [[ ! "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "Error: Docker returned an invalid local image identity." >&2
+    exit 1
+fi
+CACHE_KEY="$IMAGE_NAME|$IMAGE_ID|$PLATFORM"
+
+# smolvm requires a Docker archive, not an OCI index or zero-byte blob pointers.
+# This is a compatibility check, not archive integrity/authenticity verification.
 tar_is_complete() {
-    [[ -f "$IMAGE_TAR" ]] || return 1
-    local size
-    size=$(stat -f %z "$IMAGE_TAR" 2>/dev/null || stat -c %s "$IMAGE_TAR" 2>/dev/null || echo 0)
+    local listing manifest size
+    [[ -f "$1" ]] || return 1
+    listing=$(tar -tf "$1" 2>/dev/null) || return 1
+    [[ $'\n'"$listing"$'\n' == *$'\nmanifest.json\n'* ]] || return 1
+    manifest=$(tar -xOf "$1" manifest.json 2>/dev/null) || return 1
+    [[ -n "$manifest" ]] || return 1
+    size=$(wc -c < "$1") || return 1
     [[ "$size" -gt 1048576 ]]
 }
 
-NEW_IMAGE_ID=$(sha256sum "$IMAGE_TAR" 2>/dev/null | cut -d' ' -f1 || true)
-
-if [[ -f "$IMAGE_ID_FILE" ]] && [[ -f "$IMAGE_TAR" ]] && [[ "$NEW_IMAGE_ID" == "$(cat "$IMAGE_ID_FILE")" ]] && tar_is_complete; then
-    echo "Using existing local image cache: $IMAGE_TAR"
+CACHED_KEY=""
+if [[ -f "$IMAGE_ID_FILE" ]]; then
+    IFS= read -r CACHED_KEY < "$IMAGE_ID_FILE" || CACHED_KEY=""
+fi
+if [[ "$CACHED_KEY" == "$CACHE_KEY" && -f "$IMAGE_TAR" ]] && tar_is_complete "$IMAGE_TAR"; then
+    echo "Using image cache for current local image: $IMAGE_TAR"
 else
-    # Docker Hub reports the manifest-list id, and in a containerd store
-    # (OrbStack, Docker Desktop) `docker save` of the default multi-arch
-    # view writes a tar of index references — no layer blobs — which smolvm
-    # rejects at boot ("file not found in tar"). So: save, check, and on
-    # failure pull the LOCAL platform explicitly before saving. A tag's
-    # id is the list digest regardless of which platform was pulled, so the
-    # single-platform tag must be deleted and re-pulled: that is what makes
-    # the save emit real blobs.
+    STAGE=$(mktemp -d "$CACHE_DIR/.export.XXXXXX")
+    trap 'rm -rf "$STAGE"' EXIT
+    TEMP_TAR="$STAGE/image.tar"
     echo "Exporting $IMAGE_NAME..."
-    docker save "$IMAGE_NAME" -o "$IMAGE_TAR"
-    if ! tar_is_complete; then
-        ARCH=$(uname -m); [[ "$ARCH" == x86_64 ]] && ARCH=amd64; [[ "$ARCH" == aarch64 ]] && ARCH=arm64
-        echo "Multi-arch save lacks layer blobs; pulling linux/$ARCH explicitly..."
-        docker image rm -f "$IMAGE_NAME" >/dev/null 2>&1 || true
-        docker pull --platform "linux/$ARCH" "$IMAGE_NAME" >/dev/null 2>&1 \
-            || { echo "Error: could not pull linux/$ARCH of $IMAGE_NAME"; exit 1; }
-        docker save "$IMAGE_NAME" -o "$IMAGE_TAR"
-        tar_is_complete \
-            || { echo "Error: exported tar still lacks layer blobs; check the docker store (containerd image store + multi-arch tag)."; exit 1; }
+    SAVED=false
+    if docker save --output "$TEMP_TAR" "$IMAGE_NAME"; then
+        if tar_is_complete "$TEMP_TAR"; then
+            SAVED=true
+        else
+            echo "docker save produced an unusable archive; trying the buildx Docker exporter." >&2
+        fi
+    else
+        echo "docker save failed; trying the buildx Docker exporter." >&2
     fi
-    sha256sum "$IMAGE_TAR" | cut -d" " -f1 > "$IMAGE_ID_FILE"
-fi
-
-# Notify about SSH agent (crucial for secure git inside the sandbox)
-if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
-    echo "Warning: SSH_AUTH_SOCK is empty. Git commands inside the sandbox won't use host keys."
-else
-    echo "SSH agent detected. Enforcing secure SSH key forwarding..."
-fi
-
-# Resolve LLM endpoint (if using a local model server)
-VM_LLM_URL="${LLM_BASE_URL:-}"
-if [[ -n "$VM_LLM_URL" ]]; then
-    HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' \
-        || ifconfig 2>/dev/null | grep -Eo 'inet (10|172|192)\.[0-9.]+' | head -1 | awk '{print $2}')
-
-    if [[ -n "${HOST_IP:-}" ]]; then
-        VM_LLM_URL="${VM_LLM_URL//localhost/$HOST_IP}"
-        VM_LLM_URL="${VM_LLM_URL//127.0.0.1/$HOST_IP}"
+    if [[ "$SAVED" != true ]]; then
+        # Use the active builder unchanged. Isolated builders can fetch a pulled
+        # registry image by immutable digest without relying on the local store.
+        SOURCE=""
+        if DIGEST=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE_NAME" 2>/dev/null); then
+            if [[ "$DIGEST" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/:-]*@sha256:[0-9a-f]{64}$ ]]; then
+                SOURCE="$DIGEST"
+            fi
+        fi
+        if [[ -z "$SOURCE" ]]; then
+            if [[ -z "${PI_SANDBOX_IMAGE+x}" ]]; then
+                echo "Error: pulled image has no immutable registry digest for buildx export." >&2
+                exit 1
+            fi
+            BUILDER_INFO=$(docker buildx inspect)
+            BUILDER_DRIVER=""
+            while read -r LABEL VALUE REST; do
+                if [[ "$LABEL" == Driver: ]]; then
+                    BUILDER_DRIVER="$VALUE"
+                fi
+            done <<< "$BUILDER_INFO"
+            if [[ "$BUILDER_DRIVER" != docker ]]; then
+                echo "Error: local-only image export needs an existing docker-driver builder; select one or use a registry-backed image." >&2
+                exit 1
+            fi
+            SOURCE="$IMAGE_NAME"
+        fi
+        mkdir "$STAGE/context"
+        printf 'FROM %s\n' "$SOURCE" > "$STAGE/context/Dockerfile"
+        rm -f "$TEMP_TAR"
+        if ! docker buildx build --platform "$PLATFORM" --output "type=docker,dest=$TEMP_TAR" "$STAGE/context"; then
+            echo "Error: buildx Docker archive export failed; cache was not updated." >&2
+            exit 1
+        fi
+        if ! tar_is_complete "$TEMP_TAR"; then
+            echo "Error: exported archive is unusable; cache was not updated." >&2
+            exit 1
+        fi
     fi
-
-    echo "Using local LLM endpoint: $VM_LLM_URL"
+    printf '%s\n' "$CACHE_KEY" > "$STAGE/image_id"
+    mv -f "$TEMP_TAR" "$IMAGE_TAR"
+    mv -f "$STAGE/image_id" "$IMAGE_ID_FILE"
+    rm -rf "$STAGE"
+    trap - EXIT
 fi
 
-# Choose the agent inside the VM: pi (default) or omp (oh-my-pi). Both run
-# through the same login shell (the image ENTRYPOINT). .zshenv seeds the
-# agent dirs from the host mounts before either runs.
-# --agent overrides AGENT; the value was validated during arg parsing.
-AGENT="${AGENT_ARG:-${AGENT:-pi}}"
-
-# Run the ephemeral microVM sandbox from the local tar file
-smolvm machine run -it \
-    --net \
-    --ssh-agent \
-    --mem 2048 \
-    --cpus 4 \
-    -v "$TARGET_DIR:/workspace" \
+echo "Mounting host directory: $TARGET_DIR"
+echo "Starting an interactive shell; run $AGENT when ready. Sessions persist in normal host history."
+echo "Do not edit the same session from multiple host/VM processes at once."
+smolvm "${SMOLVM_ARGS[@]}" \
+    -v "$TARGET_DIR:$TARGET_DIR" \
+    "${STATE_MOUNTS[@]}" \
     -v "$HOST_PI_DIR:/root/.pi-host:ro" \
     -v "$HOST_OMP_DIR:/root/.omp-host:ro" \
-    -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
-    -e OPENAI_API_KEY="${OPENAI_API_KEY:-}" \
-    -e OPENAI_BASE_URL="${VM_LLM_URL:-}" \
-    -e LLM_BASE_URL="${VM_LLM_URL:-}" \
     --image "$IMAGE_TAR" \
-    -- zsh -l -c "exec $AGENT"
+    -- /usr/local/bin/pi-agent-seed.py zsh -l

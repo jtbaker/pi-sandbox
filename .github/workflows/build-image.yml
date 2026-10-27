@@ -5,7 +5,9 @@ on:
     branches: [main]
     paths:
       - Dockerfile.pi
-      - pi-agent-seed.sh
+      - pi-agent-seed.py
+      - pi-network-policy.py
+      - sandbox-network.json
       - sandbox.json.autonomous
       - .github/workflows/build-image.yml
   workflow_dispatch:
@@ -34,7 +36,7 @@ jobs:
         with:
           file: Dockerfile.pi
           platforms: linux/amd64,linux/arm64
-          push: true
+          outputs: type=registry,compression=zstd,compression-level=22,force-compression=true,oci-mediatypes=true
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ github.sha }}

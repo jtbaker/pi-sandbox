@@ -16,7 +16,7 @@ else
   docker buildx use pi-builder
 fi
 
-# Build multi-platform image (zstd-compressed for optimal size/performance)
+# Publish OCI layers with maximum Zstd compression, including inherited layers.
 docker buildx build \
   --builder pi-builder \
   --platform "${PLATFORMS}" \
