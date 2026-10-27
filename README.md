@@ -1,6 +1,6 @@
 # Pi Sandbox
 
-A secure, ephemeral microVM sandbox for running the [Pi](https://pi.dev) coding agent against any project directory on your host machine.
+A secure, ephemeral microVM sandbox for running the [Pi](https://pi.dev) or [omp](https://omp.sh) (oh-my-pi) coding agent against any project directory on your host machine.
 
 ## Overview
 
@@ -39,6 +39,21 @@ Pi Sandbox launches the Pi coding agent inside an isolated smolvm microVM. Your 
 ```
 
 Rebuild and re-export the tar whenever you change `Dockerfile.pi`.
+
+## Agents
+
+The VM runs Pi by default. To launch [omp](https://omp.sh) — the Rust-based, batteries-included Pi fork — instead:
+
+```bash
+# Flag or environment variable, either works
+./pi-sandbox.sh --agent omp /path/to/project
+AGENT=omp ./pi-sandbox.sh
+```
+
+Both agents are installed in the image and seeded the same way: their host
+login state and model config come from `~/.pi/agent` (Pi) or `~/.omp/agent`
+(omp), copied into an ephemeral VM-local directory. Sessions and history are
+never seeded, so a VM run cannot list or resume host sessions.
 
 ## Installing Globally
 
@@ -104,37 +119,54 @@ Inside the microVM, `localhost` refers to the VM itself, not your host machine. 
 ## How It Works
 
 1. The script resolves the target directory (defaults to `pwd`) and mounts it at `/workspace` inside the VM.
-2. Your `~/.pi` directory is mounted to persist login state, themes, and templates across runs.
+2. Your `~/.pi` and `~/.omp` directories are mounted read-only. At VM boot, the agent's config dir (`~/.pi/agent` for pi, `~/.omp/agent` for omp — both read `PI_CODING_AGENT_DIR`) is seeded into an ephemeral VM-local directory, carrying login state, model config, and extensions without ever being modified by the VM.
 3. **Cloud mode:** API keys are passed as environment variables. The agent calls cloud LLM APIs over outbound HTTPS.
 4. **Local model mode:** The script detects your host's LAN IP, rewrites `localhost` in `LLM_BASE_URL`, and passes the result as both `OPENAI_BASE_URL` and `LLM_BASE_URL` into the VM.
 5. If an SSH agent is detected, credentials are securely forwarded for git operations inside the sandbox.
-6. The microVM boots with the `pi-sandbox` image and runs the `pi` entrypoint.
+6. The microVM boots with the `pi-sandbox` image and runs the selected agent (`pi` by default, `omp` with `--agent omp`).
 
 ## Container Image
 
 The sandbox image is defined in `Dockerfile.pi` and includes:
 
-- **Node.js 22** (Bullseye slim)
-- System utilities: `git`, `curl`, `ripgrep`, `build-essential`
-- The `@oh-my-pi/pi-coding-agent` package installed globally
+- **Node.js 24** (slim)
+- System utilities: `git`, `curl`, `ripgrep`, `build-essential`, `bubblewrap`, `socat`
+- The `@earendil-works/pi-coding-agent` package installed globally (pinned release)
+- The `omp` binary installed via `curl -fsSL https://omp.sh/install | sh -s -- --binary --ref <tag>` (pinned release)
 
 The image is published to Docker Hub as `jasonbaker/pi-sandbox`. The script pulls it automatically on each run.
 
-### Building & Pushing
+### Continuous Builds
+
+`.github/workflows/build-image.yml` builds the multi-platform image with
+BuildKit (amd64 + arm64 via QEMU) and pushes it to Docker Hub on every push
+that touches the image files, plus on manual `workflow_dispatch` runs. Each
+run tags `latest` and the commit SHA (`jasonbaker/pi-sandbox:<sha>`), so a
+bad push is easy to roll back to. The workflow needs two repository secrets:
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token with
+push rights to the repository).
+
+Triggers are paths-limited to `Dockerfile.pi`, `pi-agent-seed.sh`,
+`sandbox.json.autonomous`, and the workflow itself. `pi-sandbox.sh` never
+enters the image (it runs on the host), so changing it doesn't rebuild.
+
+### Building & Pushing Locally
+
+`./build.sh` remains for local one-off builds (CI covers the normal path):
 
 ```bash
-./build.sh
-```
-
-This builds a cross-platform image (`linux/amd64`, `linux/arm64`) and pushes it to the registry.
-
-```bash
-# Build with a specific tag
-./build.sh v1.0
-
-# Build for a single platform
+./build.sh                      # latest tag, both platforms
+./build.sh v1.0                 # specific tag
 PLATFORMS=linux/amd64 ./build.sh
 ```
+
+One caveat: with a containerd-based Docker store (OrbStack, Docker Desktop),
+`docker save` of a multi-arch tag writes an index-only tar — no layer blobs —
+which smolvm rejects at boot with "file not found in tar". Pull or export
+single-platform for the local tar: `docker pull --platform linux/arm64`, or
+`docker buildx build --output type=oci,dest=~/.cache/pi-sandbox/pi-sandbox.tar`.
+`pi-sandbox.sh` validates its cache by tar hash and re-exports when the tar
+is bad.
 
 ## Environment Variables
 
@@ -143,11 +175,12 @@ PLATFORMS=linux/amd64 ./build.sh
 | `ANTHROPIC_API_KEY` | API key for Anthropic models (cloud mode) |
 | `OPENAI_API_KEY` | API key for OpenAI models (cloud mode) |
 | `LLM_BASE_URL` | Custom LLM endpoint (e.g. `http://localhost:8001/v1`). When set, overrides cloud mode. |
+| `AGENT` | Agent to run in the VM: `pi` (default) or `omp`. The `--agent` flag overrides it. |
 
 ## Security
 
 - The microVM is ephemeral — no state persists after the agent exits.
-- Only the specified workspace directory and `~/.pi` are mounted.
+- Only the specified workspace directory and (read-only) `~/.pi` and `~/.omp` are mounted.
 - SSH keys never leave the host; they are proxied securely via the agent socket.
 - Network access is required for LLM API communication.
 

@@ -13,7 +13,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Autonomous agent environment ------------------------------------------------
-# The host's ~/.pi is mounted read-only at /root/.pi-host (see pi-sandbox.sh).
+# The host's ~/.pi and ~/.omp are mounted read-only at /root/.pi-host and
+# /root/.omp-host (see pi-sandbox.sh).
 # pi-agent-seed.sh copies it into an ephemeral VM-local agent dir
 # (PI_CODING_AGENT_DIR) and installs the autonomous sandbox profile, so VM
 # runs never share or modify the host's ~/.pi. It runs from /root/.zshenv
@@ -56,6 +57,14 @@ RUN curl https://install.duckdb.org | sh
 
 # Install the Pi coding agent globally (pin to a known-good release)
 RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1
+
+# Install the omp (oh-my-pi) coding agent globally (pin to a known-good
+# release, like the pi pin above). omp has a native Rust core; the official
+# installer's --binary --ref mode fetches the prebuilt release binary for the
+# target platform (linux/amd64 + linux/arm64 here) and verifies its sha256.
+# omp reads its agent dir from PI_CODING_AGENT_DIR (seeded from the host's
+# ~/.omp/agent by pi-agent-seed.sh), the same env var pi uses.
+RUN curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v18.12.6
 
 # Set up the workspace mount point inside the VM
 WORKDIR /workspace
