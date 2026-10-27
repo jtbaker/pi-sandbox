@@ -1,19 +1,21 @@
 #!/usr/bin/python3
-"""Snapshot read-only host configuration into private, VM-local agent roots."""
+"""Seed private configuration around required, native shared session mounts."""
 
 from contextlib import closing
 import fcntl
+import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import time
 
-HOST_ROOTS = ((Path("/root/.pi-host"), Path("/root/.pi")),
-              (Path("/root/.omp-host"), Path("/root/.omp")))
+HOST_ROOTS = ((Path("/root/.pi-host"), ".pi"),
+              (Path("/root/.omp-host"), ".omp"))
 SKIP_DIRS = {"sessions", "terminal-sessions", "cache", "caches", "logs", "bin",
              "__pycache__", ".git"}
 # Host runtime trees are not configuration. Limit this rule to config roots
@@ -45,7 +47,7 @@ def backup_database(source, destination):
         raise RuntimeError(f"SQLite snapshot failed for {source}: {error}") from error
 
 
-def copy_tree(source, destination, relative=Path()):
+def copy_tree(source, destination, relative=Path(), shared=frozenset()):
     destination.mkdir(mode=0o700)
     config_root = not relative.parts or (
         len(relative.parts) == 2 and relative.parts[0] == "profiles")
@@ -54,9 +56,10 @@ def copy_tree(source, destination, relative=Path()):
         target = destination / entry.name
         # Do not follow host symlinks or import sockets/devices/FIFOs.
         if stat.S_ISDIR(mode):
-            if entry.name not in SKIP_DIRS and not (
-                    config_root and entry.name in RUNTIME_DIRS):
-                copy_tree(entry, target, relative / entry.name)
+            if (relative / entry.name not in shared
+                    and entry.name not in SKIP_DIRS and not (
+                        config_root and entry.name in RUNTIME_DIRS)):
+                copy_tree(entry, target, relative / entry.name, shared)
         elif stat.S_ISREG(mode):
             if (entry.name.startswith(("history.db", "trust.db"))
                     or entry.name in {"trust.json", ".seeded"}
@@ -76,36 +79,218 @@ def copy_tree(source, destination, relative=Path()):
             os.chmod(target, 0o700 if mode & stat.S_IXUSR else 0o600)
 
 
+def absolute_path(value, name):
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise RuntimeError(f"{name} must be an absolute path without '..'")
+    return path
+
+
+def ensure_directory(path):
+    # Never follow a preexisting symlink while building the mirrored VM paths.
+    for directory in (*reversed(path.parents), path):
+        if directory.is_symlink():
+            raise RuntimeError(f"directory must not be a symlink: {directory}")
+        if directory.exists():
+            if not directory.is_dir():
+                raise RuntimeError(f"not a directory: {directory}")
+        else:
+            directory.mkdir(mode=0o700)
+
+
+def source_profiles(source):
+    profiles = source / "profiles"
+    if profiles.is_symlink():
+        raise RuntimeError(f"profile root must not be a symlink: {profiles}")
+    if not profiles.exists():
+        return []
+    if not profiles.is_dir():
+        raise RuntimeError(f"profile root is not a directory: {profiles}")
+    names = []
+    for profile in profiles.iterdir():
+        if profile.is_symlink():
+            raise RuntimeError(f"profile must not be a symlink: {profile}")
+        if profile.is_dir():
+            names.append(profile.name)
+    return sorted(names)
+
+
+def mount_paths():
+    # Bind mounts on the same filesystem can evade Path.is_mount(). Linux
+    # mountinfo supplies the exact mountpoints, including virtiofs mounts.
+    mounts = set()
+    with open("/proc/self/mountinfo") as mountinfo:
+        for line in mountinfo:
+            encoded = line.split()[4]
+            for escaped, character in ((r"\040", " "), (r"\011", "\t"),
+                                       (r"\012", "\n"), (r"\134", "\\")):
+                encoded = encoded.replace(escaped, character)
+            mounts.add(Path(encoded))
+    return mounts
+
+
+def state_layout(home):
+    layouts = []
+    for source, name in HOST_ROOTS:
+        if source.is_symlink() or (source.exists() and not source.is_dir()):
+            raise RuntimeError(f"configuration mount is not a directory: {source}")
+        shared = {Path("agent/sessions")}
+        if name == ".omp":
+            shared.add(Path("agent/blobs"))
+            for profile in source_profiles(source):
+                agent = Path("profiles") / profile / "agent"
+                shared.update((agent / "sessions", agent / "blobs"))
+        layouts.append((source, home / name, shared))
+    return layouts
+
+
+def validate_mounts(layouts, mounts):
+    for _, destination, shared in layouts:
+        for relative in shared:
+            path = destination / relative
+            # Validate ancestors too: a symlink above the mount would give
+            # session headers a different realpath from the host's native path.
+            for directory in (path, *path.parents):
+                if directory.is_symlink() or not directory.is_dir():
+                    raise RuntimeError(f"state path is not a plain directory: {directory}")
+            if path not in mounts and not path.is_mount():
+                raise RuntimeError(f"required shared state mount is missing: {path}")
+
+
+def structural_directories(destination, shared):
+    directories = {destination}
+    for relative in shared:
+        directories.update(destination / parent for parent in relative.parents)
+    return directories
+
+
+def validate_native_root(destination, shared, mounts):
+    structural = structural_directories(destination, shared)
+    state = {destination / relative for relative in shared}
+
+    def visit(directory):
+        if directory in mounts or directory.is_mount():
+            raise RuntimeError(f"configuration directory must be VM-private: {directory}")
+        for entry in directory.iterdir():
+            if entry in state:
+                continue  # Never inspect or change shared mount contents.
+            if entry not in structural or entry.is_symlink() or not entry.is_dir():
+                raise RuntimeError(f"unexpected preexisting configuration path: {entry}")
+            visit(entry)
+
+    visit(destination)
+    return structural
+
+
+def merge_snapshot(snapshot, destination, structural):
+    for entry in snapshot.iterdir():
+        target = destination / entry.name
+        if target.exists() or target.is_symlink():
+            if target not in structural or target.is_symlink() or not target.is_dir():
+                raise RuntimeError(f"refusing to replace existing configuration: {target}")
+            if not entry.is_dir():
+                raise RuntimeError(f"configuration conflicts with state directory: {target}")
+            merge_snapshot(entry, target, structural)
+        else:
+            entry.rename(target)
+
+
+def write_sandbox_profile(destination, home):
+    with PROFILE.open() as source:
+        profile = json.load(source)
+    # Translate only native private-HOME paths, never the fixed RO host roots.
+    paths = {f"/root/{relative}": str(home / relative) for relative in (
+        ".pi", ".omp", ".npm", ".cache", ".local/share", ".config")}
+    for permission in ("allowWrite", "denyRead"):
+        profile["filesystem"][permission] = [
+            paths.get(path, path) for path in profile["filesystem"][permission]]
+    with destination.open("w") as target:
+        json.dump(profile, target, indent=2)
+        target.write("\n")
+    os.chmod(destination, 0o600)
+
+
+def ensure_symlink(path, target):
+    if path.exists() or path.is_symlink():
+        if not path.is_symlink() or path.resolve() != target.resolve():
+            raise RuntimeError(f"refusing to replace existing path: {path}")
+    else:
+        path.symlink_to(target)
+
+
+def prepare_private_home(home):
+    if home != Path("/root"):
+        for name in (".zshrc", ".oh-my-zsh"):
+            ensure_symlink(home / name, Path("/root") / name)
+        # Image installers source ~/.local/bin/env from the login shell.
+        # This is a private image directory, never the host's executable tree.
+        ensure_directory(home / ".local")
+        ensure_symlink(home / ".local/bin", Path("/root/.local/bin"))
+    gitconfig = home / ".gitconfig"
+    if gitconfig.exists() or gitconfig.is_symlink():
+        raise RuntimeError(f"refusing to replace existing private git config: {gitconfig}")
+    subprocess.run(["git", "config", "--file", str(gitconfig), "--add",
+                    "safe.directory", str(Path.cwd())], check=True)
+
+
+def prepare_workspace_alias():
+    value = os.environ.get("PI_SANDBOX_WORKSPACE_ALIAS")
+    if not value:
+        return
+    alias = absolute_path(value, "PI_SANDBOX_WORKSPACE_ALIAS")
+    if Path("/tmp") not in alias.parents:
+        raise RuntimeError("workspace alias must name a project below /tmp")
+    ensure_directory(alias.parent)
+    ensure_symlink(alias, Path.cwd())
+
+
 def seed():
     if not NETWORK_MARKER.is_file():
         raise RuntimeError("network policy was not initialized; launch through pi-sandbox.sh")
+    if os.environ.get("PI_SANDBOX_PERSIST_SESSIONS") != "1":
+        raise RuntimeError("persistent session mounts are required; launch through pi-sandbox.sh")
+    home = absolute_path(os.environ.get("HOME", ""), "HOME")
+    temporary = absolute_path(os.environ.get("TMPDIR", ""), "TMPDIR")
     os.umask(0o077)
     with open("/run/pi-sandbox-seed.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        mounts = mount_paths()
+        if home in mounts or home.is_mount():
+            raise RuntimeError(f"HOME must be VM-private, not a mount: {home}")
+        ensure_directory(home)
+        ensure_directory(temporary)
+        layouts = state_layout(home)
+        validate_mounts(layouts, mounts)
         if MARKER.exists():
             return
-        # Stage both roots before installing either. Failure stops boot rather
-        # than opening a shell with a partial or mixed authentication snapshot.
-        with tempfile.TemporaryDirectory(prefix=".pi-sandbox-seed-", dir="/root") as tmp:
+        structural = {}
+        for _, destination, shared in layouts:
+            structural[destination] = validate_native_root(destination, shared, mounts)
+            # Mount setup creates these VM-private ancestors before seeding.
+            # Harden only those directories, never the shared state roots.
+            for directory in structural[destination]:
+                os.chmod(directory, 0o700)
+        # Stage both roots before installing either. State directories are
+        # excluded before traversal; their permissions and contents stay intact.
+        with tempfile.TemporaryDirectory(prefix=".pi-sandbox-seed-", dir=home) as tmp:
             staged = []
-            for source, destination in HOST_ROOTS:
-                if destination.exists() or destination.is_symlink():
-                    raise RuntimeError(f"refusing to replace existing {destination}")
+            for source, destination, shared in layouts:
                 snapshot = Path(tmp) / destination.name
                 if source.exists():
-                    if not source.is_dir() or source.is_symlink():
-                        raise RuntimeError(f"configuration mount is not a directory: {source}")
-                    copy_tree(source, snapshot)
+                    copy_tree(source, snapshot, shared=shared)
                 else:
                     snapshot.mkdir(mode=0o700)
                 agent = snapshot / "agent"
                 agent.mkdir(mode=0o700, exist_ok=True)
                 if destination.name == ".pi":
-                    shutil.copyfile(PROFILE, agent / "sandbox.json")
-                    os.chmod(agent / "sandbox.json", 0o600)
+                    write_sandbox_profile(agent / "sandbox.json", home)
                 staged.append((snapshot, destination))
+            if state_layout(home) != layouts:
+                raise RuntimeError("host profiles changed during configuration snapshot; relaunch")
+            prepare_private_home(home)
+            prepare_workspace_alias()
             for snapshot, destination in staged:
-                snapshot.rename(destination)
+                merge_snapshot(snapshot, destination, structural[destination])
         MARKER.touch(mode=0o600)
 
 

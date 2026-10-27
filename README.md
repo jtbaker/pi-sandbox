@@ -1,6 +1,6 @@
 # Pi Sandbox
 
-Run [Pi](https://pi.dev) or [omp](https://omp.sh) inside an ephemeral smolvm microVM, with a writable project directory and read-only access to the host's agent configuration.
+Run [Pi](https://pi.dev) or [omp](https://omp.sh) inside an ephemeral smolvm microVM, with a writable project directory, persistent native session history, and private copies of the host's agent configuration.
 
 ## Prerequisites
 
@@ -20,7 +20,7 @@ docker buildx build --load -f Dockerfile.pi -t pi-sandbox:local .
 PI_SANDBOX_IMAGE=pi-sandbox:local ./pi-sandbox.sh --dns 100.100.100.100 /path/to/project
 ```
 
-The VM opens an interactive login shell. Run `pi` or `omp` from that shell.
+The VM opens an interactive login shell. Its zsh prompt starts with `🔒 ` to identify the sandbox; the rest of the prompt is unchanged. Run `pi` or `omp` from that shell.
 
 To use the published image instead:
 
@@ -61,16 +61,40 @@ The host sources and VM-local copies are separate:
 
 | Agent | Read-only host source in VM | Writable VM-local configuration |
 |---|---|---|
-| Pi | `/root/.pi-host` from host `~/.pi` | `/root/.pi`, including `/root/.pi/agent` |
-| omp | `/root/.omp-host` from host `~/.omp` | `/root/.omp`, including `/root/.omp/agent` |
+| Pi | `/root/.pi-host` from host `~/.pi` | `$HOME/.pi`, including `$HOME/.pi/agent` |
+| omp | `/root/.omp-host` from host `~/.omp` | `$HOME/.omp`, including `$HOME/.omp/agent` |
 
 At startup, `pi-agent-seed.py` snapshots each source into its own private directory. Root-level configuration, agent settings, credentials, extensions, and named profiles retain their directory structure. There is no global `PI_CODING_AGENT_DIR` override to mix the agents' settings or credentials.
 
-Seeding runs before the shell starts and only once per VM. Nested shells do not refresh the snapshot or overwrite changes made by an agent. Host configuration changes take effect in the next VM, not in an existing VM's private copy. VM-local settings, refreshed tokens, and new sessions are discarded when that VM exits; nothing is synchronized back to the host. The mounted source directories remain live and readable.
+Seeding runs before the shell starts and only once per VM. Nested shells do not refresh the snapshot or overwrite changes made by an agent. Host configuration changes take effect in the next VM, not in an existing VM's private copy. VM-local settings and refreshed tokens are discarded when the VM exits. The mounted source directories remain live and readable.
 
-Snapshot rules:
+### Persistent Sessions
 
-- Directories are private (`0700`). Ordinary files are `0600`; files with the owner's executable bit keep that bit as `0700`.
+The following host directories are mounted writable at their native paths inside the VM:
+
+| Agent | Shared host state |
+|---|---|
+| Pi | `~/.pi/agent/sessions` |
+| omp default profile | `~/.omp/agent/sessions` and `~/.omp/agent/blobs` |
+| Each existing omp profile | `~/.omp/profiles/NAME/agent/sessions` and `~/.omp/profiles/NAME/agent/blobs` |
+
+The full session trees are shared, including omp's same-basename subdirectories for artifacts and subagent transcripts. Its content-addressed image blobs are also shared. The launcher creates missing state directories and rejects symlinked state paths; existing state-directory contents and permissions are not changed by seeding.
+
+The guest uses the host's canonical `HOME`, project working directory, and `TMPDIR` paths. This keeps both agents' project-history buckets and recorded working directories consistent between host and VM. It does **not** mount the full host home or temporary directory: all other paths remain VM-private.
+
+The guest's `~/.local/bin` refers to the image-installed tools, not the host's executable directory. Its login shell can load the image's tool environment without exposing host binaries.
+
+Open the same project on the host or in a later VM and use the agent's normal history controls, such as `pi --continue`, `omp --continue`, or `omp --resume SESSION_ID`. No custom session directory or import step is required. Session files are written directly to the host mounts, not copied back during shutdown. Only data the agent has actually written is preserved; this is not a guarantee against buffered writes or a torn final record.
+
+Create named omp profiles on the host before starting the VM. A profile created only inside an already running VM has no shared state mounts and is discarded with that VM.
+
+**Do not edit the same session from multiple host/VM processes at once.** Session ownership does not coordinate across separate VMs or between macOS and Linux. Shared history is writable host state: VM code can alter or delete existing transcripts, artifacts, and blobs.
+
+SQLite history indexes, terminal breadcrumbs, and runtime leases remain private to each process environment. Native JSONL history remains discoverable without sharing a live SQLite database. Sessions left in older VMs are not automatically imported, and legacy `/workspace` working directories are not rewritten.
+
+### Snapshot Rules
+
+- Copied directories are private (`0700`). Ordinary copied files are `0600`; files with the owner's executable bit keep that bit as `0700`. These rules do not change the shared state mounts.
 - Symlinks, sockets, devices, and FIFOs are not copied or followed. Symlinked extensions must be installed as ordinary files inside the VM if needed.
 - Directories named `sessions`, `terminal-sessions`, `cache`, `caches`, `logs`, `bin`, `__pycache__`, or `.git` are omitted at any depth. Host binaries and cached native dependencies may not run on Linux; install required Linux dependencies in the VM.
 - At each configuration root (including named profile roots), `run`, `ssh-control`, `puppeteer`, `natives`, and `.supervisor` are omitted. These contain host daemon state, browser profiles, sockets, or platform-specific binaries. A portable extension directory such as `agent/extensions/run` is still copied.
@@ -78,7 +102,7 @@ Snapshot rules:
 - SQLite `.db` files use a read-only SQLite backup, including committed WAL data, rather than a raw copy of a live database. An unreadable or invalid configuration database stops boot with its path and SQLite error instead of silently dropping credentials or printing file contents. A live WAL database must have readable WAL/SHM files; if SQLite cannot read it through the read-only mount, stop its host writer or checkpoint it before launching again.
 - Pi receives `sandbox.json.autonomous` as its VM-local `agent/sandbox.json`. This is a Pi extension policy, not an omp policy or an OS-level security boundary.
 
-Skipping history in the private copy does **not** hide it from code inside the VM: the full host source directories are still mounted read-only. Do not share a directory whose contents the agent must not read.
+Omitting files from the private snapshot does **not** hide them from code inside the VM: the full host source directories are still mounted read-only. Do not share a directory whose contents the agent must not read.
 
 ## LLM Backends
 
@@ -132,10 +156,10 @@ The rule constrains destination IPs and TCP ports, not HTTP paths or the content
 
 ## Security Boundaries
 
-- The microVM is the host isolation boundary. Only the requested workspace is mounted writable; both agent configuration sources are mounted read-only.
+- The microVM is the host isolation boundary. The project and the session/blob directories listed above are mounted writable. Host configuration files remain available through read-only source mounts and VM-private snapshots.
 - Trusted init configures the network before the workload runs. The workload remains root inside the guest with filesystem-only capabilities; read-only host mounts are also enforced by the backing filesystem. Private file modes do not hide credentials from the agent itself.
 - SSH forwarding is **off by default**. `--ssh-agent` requires an existing `SSH_AUTH_SOCK` Unix socket. Forwarding does not copy private keys, but it allows VM processes to request signatures and authenticate as you. Prefer a dedicated agent with only the keys needed for this project.
-- Credentials in shared configuration are readable inside the VM. An agent, extension, or compromised dependency can disclose them over the network. Read-only mounts prevent host-file changes; they do not prevent credential theft or use.
+- Credentials in shared configuration are readable inside the VM. An agent, extension, or compromised dependency can disclose them over the network. Read-only configuration mounts prevent changes to those files; they do not prevent credential theft or use.
 - The workspace is writable host state, including its `.git` directory and any secrets already in the workspace. Review changes before running host-side scripts or hooks.
 - Public Internet access remains enabled; private/tailnet access is restricted by the network policy above. The host must remain connected to Tailscale. The VM is not enrolled as a separate Tailscale node.
 - Agent extensions and configuration are executable/trusted inputs, not sanitized data. The Pi extension's filesystem rules are defense in depth, not a replacement for the microVM and read-only mounts.
@@ -165,7 +189,9 @@ PLATFORMS=linux/amd64 ./build.sh  # Builds and pushes one platform
 ./verify-guest.sh
 ```
 
-This builds the working tree without publishing and boots disposable microVMs using only synthetic configuration. Kernel network fixtures prove allowed destination/port paths and count rejected IPv4 and IPv6 tailnet packets. Workload checks prove nftables and raw-packet bypass are denied while host-owned workspace files remain editable. The suite also checks separate agent roots, private permissions, omitted histories/runtime trees/symlinks, read-only host sources, committed SQLite WAL snapshots, consistent backups during concurrent writes, preserved VM edits across nested shells, and both agents' versions. It never mounts your real `~/.pi` or `~/.omp`. Failed runs retain their synthetic fixture directory for diagnosis.
+This builds the working tree without publishing and boots disposable microVMs using only synthetic configuration. Kernel network fixtures prove allowed destination/port paths and count rejected IPv4 and IPv6 tailnet packets. Workload checks prove nftables and raw-packet bypass are denied while host-owned workspace files remain editable. The suite also checks separate agent roots, private permissions, omitted runtime trees and symlinks, read-only host sources, committed SQLite WAL snapshots, consistent backups during concurrent writes, preserved VM edits across nested shells, and both agents' versions.
+
+Real Pi session APIs and the real omp CLI create, discover, and continue native transcripts across separate VMs. omp default and named profiles replay prior turns and image blobs through a local synthetic model provider. The host observes transcripts, artifacts, and blobs before the first VM exits. A cold-config consumer stage uses the pinned Linux agents at native host paths, without seeding or a shared SQLite index; it does not require host-installed agents. The suite never mounts your real `~/.pi` or `~/.omp`. Failed runs retain their synthetic fixture directory for diagnosis.
 
 To use an existing Docker-format image archive:
 

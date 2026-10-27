@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 # Build and boot the working tree without publishing. Only synthetic host
-# configuration is mounted; neither ~/.pi nor ~/.omp is read or changed.
+# configuration and session state are mounted; real ~/.pi and ~/.omp stay untouched.
 # Reuse a local Docker archive with PI_SANDBOX_VERIFY_IMAGE_TAR=/path/image.tar.
 set -euo pipefail
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/pi-sandbox-verify.XXXXXXXX")"
+TMP="$(cd "$TMP" && pwd -P)"
+HOST_HOME="$TMP/home"
+HOST_TMPDIR="$TMP/native-tmp"
+export PI_VERIFY_HOME="$HOST_HOME" PI_VERIFY_TMPDIR="$HOST_TMPDIR"
+ACTIVE_VM=""
 cleanup() {
     local result=$?
+    if [[ -n "$ACTIVE_VM" ]]; then
+        kill "$ACTIVE_VM" 2>/dev/null || true
+        wait "$ACTIVE_VM" 2>/dev/null || true
+    fi
     if [[ "$result" != 0 ]]; then
         printf 'Synthetic fixture diagnostics retained at %s\n' "$TMP" >&2
     else
@@ -49,8 +58,8 @@ grep -Eq '^(\./)?manifest\.json$' "$TMP/archive-members" \
     || fail 'image archive is not Docker-compatible (manifest.json missing)'
 printf 'PASS: Docker-compatible image archive\n'
 
-mkdir -p "$TMP/fixtures" "$TMP/control" "$TMP/workspace" "$TMP/default-workspace" "$TMP/preparation-workspace"
-for workspace in "$TMP/workspace" "$TMP/default-workspace" "$TMP/preparation-workspace"; do
+mkdir -p "$TMP/fixtures" "$TMP/control" "$HOST_HOME/project" "$HOST_TMPDIR" "$TMP/default-workspace" "$TMP/preparation-workspace"
+for workspace in "$HOST_HOME/project" "$TMP/default-workspace" "$TMP/preparation-workspace"; do
     printf 'host workspace content\n' > "$workspace/editable-host-file"
 done
 printf '{"tailnetHost":"100.64.0.10","httpsPort":443}\n' > "$TMP/control/network.json"
@@ -119,7 +128,7 @@ def workload():
     for name in ("CapAmb", "CapInh"):
         assert int(status[name].strip(), 16) == 0, f"{name} is not zero"
     assert status["NoNewPrivs"].strip() == "1", "NoNewPrivs is not enabled"
-    editable = Path("/workspace/editable-host-file")
+    editable = Path.cwd() / "editable-host-file"
     editable.write_text("guest workspace edit\n")
     editable.chmod(0o600)
     assert editable.read_text() == "guest workspace edit\n"
@@ -317,6 +326,19 @@ for agent in pi omp; do
     find "$root" -type f -exec chmod 0666 {} +
     chmod 0777 "$root/agent/extensions/fixture-tool.sh"
 done
+# State is intentionally separate from read-only configuration fixtures, so the
+# final byte-for-byte config comparison excludes legitimate transcript writes.
+for state in "$HOST_HOME/.pi/agent/sessions" \
+    "$HOST_HOME/.omp/agent/sessions" "$HOST_HOME/.omp/agent/blobs" \
+    "$HOST_HOME/.omp/profiles/work/agent/sessions" "$HOST_HOME/.omp/profiles/work/agent/blobs"; do
+    mkdir -p "$state"
+    printf 'mounted state is not a private config copy\n' > "$state/mount-marker"
+    chmod 0777 "$state"
+    chmod 0666 "$state/mount-marker"
+done
+printf 'host HOME is not a volume\n' > "$HOST_HOME/private-home-marker"
+mkdir -p "$TMP/fixtures/omp/profiles/work/agent"
+printf '{}\n' > "$TMP/fixtures/omp/profiles/work/agent/config.yml"
 cat > "$TMP/control/sqlite-fixtures.py" <<'SQLITE'
 import shutil
 import sqlite3
@@ -360,7 +382,7 @@ if sys.argv[1] == "prepare":
     Path("/fixtures/sqlite-prepared").write_text("complete\n")
 elif sys.argv[1] == "check":
     for agent in ("pi", "omp"):
-        database = Path("/root") / f".{agent}" / "state.db"
+        database = Path.home() / f".{agent}" / "state.db"
         assert database.is_file()
         # Assert before connecting: opening a WAL-mode database can itself
         # create sidecars, which must not disguise files copied from the host.
@@ -423,9 +445,11 @@ SQLITE
 # library. Writable host mounts contain only disposable synthetic fixtures.
 if ! (cd "$TMP" && smolvm machine run --unprivileged --net-backend virtio-net \
     --smolfile "$TMP/Smolfile" --no-init-cache --timeout 120s --mem 2048 --cpus 2 \
-    -v "$TMP/control:/verify:ro" -v "$TMP/preparation-workspace:/workspace" \
+    --workdir "$TMP/preparation-workspace" -v "$TMP/control:/verify:ro" \
+    -v "$TMP/preparation-workspace:$TMP/preparation-workspace" \
     -v "$TMP/fixtures:/fixtures" --image "$IMAGE_TAR" \
-    -- /usr/local/bin/pi-agent-seed.py /usr/bin/python3 /verify/sqlite-fixtures.py prepare) \
+    -- /usr/bin/setpriv --bounding-set=-all,+dac_override,+fowner --inh-caps=-all \
+    --ambient-caps=-all --no-new-privs /usr/bin/python3 /verify/sqlite-fixtures.py prepare) \
     > "$TMP/sqlite-preparation.log" 2>&1; then
     if [[ -f "$TMP/preparation-workspace/failure" ]]; then
         IFS= read -r detail < "$TMP/preparation-workspace/failure"
@@ -439,38 +463,366 @@ printf 'PASS: genuine committed SQLite WAL fixtures prepared without host depend
 # Reading a file may update atime, which ordinary tar headers do not include.
 COPYFILE_DISABLE=1 tar -cf "$TMP/fixtures-before.tar" -C "$TMP/fixtures" pi omp
 
+# Exercise published storage APIs, not a hand-written approximation of JSONL.
+cat > "$TMP/control/pi-sessions.mjs" <<'PI_SESSIONS'
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { SessionManager } from "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js";
+
+const [mode, previous] = process.argv.slice(2);
+const cwd = process.cwd();
+const text = (manager) => JSON.stringify(manager.buildSessionContext().messages);
+const append = (manager, phase) => {
+    manager.appendMessage({ role: "user", content: `fixture-pi-${phase}`, timestamp: Date.now() });
+    manager.appendMessage({
+        role: "assistant", content: [{ type: "text", text: `fixture-pi-answer-${phase}` }],
+        api: "openai-completions", provider: "fixture", model: "fixture",
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "stop", timestamp: Date.now(),
+    });
+};
+let manager;
+if (mode === "fixture") {
+    manager = SessionManager.create(cwd);
+    assert(!fs.existsSync(manager.getSessionFile()), "Pi should persist lazily");
+    append(manager, mode);
+    const source = manager.getSessionFile();
+    manager = SessionManager.forkFrom(source, cwd);
+    assert.equal(manager.getHeader().parentSession, source);
+    assert(path.isAbsolute(source) && fs.existsSync(source));
+    // Ensure continueRecent has one winner even on coarse-mtime filesystems.
+    fs.utimesSync(source, new Date(0), new Date(0));
+} else {
+    const listed = await SessionManager.list(cwd);
+    assert(listed.some((entry) => entry.path === previous), "native Pi listing lost session");
+    manager = SessionManager.continueRecent(cwd);
+    assert.equal(manager.getSessionFile(), previous, "native Pi continue chose wrong session");
+    assert(text(manager).includes("fixture-pi-answer-fixture"), "Pi replay lost first turn");
+    assert(fs.existsSync(manager.getHeader().parentSession), "absolute parentSession is not host-valid");
+    append(manager, mode);
+}
+const bucket = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+assert.equal(path.dirname(manager.getSessionFile()), path.join(process.env.HOME, ".pi/agent/sessions", bucket));
+assert.equal(manager.getHeader().cwd, cwd);
+const opened = SessionManager.open(manager.getSessionFile());
+assert(text(opened).includes("fixture-pi-answer-fixture"), "Pi public reader lost turn");
+assert((await SessionManager.listAll()).some((entry) => entry.path === manager.getSessionFile()));
+console.log(JSON.stringify({ path: manager.getSessionFile(), parent: manager.getHeader().parentSession }));
+PI_SESSIONS
+
+cat > "$TMP/control/sessions.py" <<'SESSIONS'
+import base64
+import hashlib
+import json
+import os
+import re
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+import zlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+HOME = Path(os.environ["HOME"])
+CWD = Path.cwd()
+ROOTS = [HOME / ".pi/agent", HOME / ".omp/agent", HOME / ".omp/profiles/work/agent"]
+MOUNTS = [ROOTS[0] / "sessions", *[root / name for root in ROOTS[1:] for name in ("sessions", "blobs")]]
+PROOF = CWD / "session-proof.json"
+MARKER = "mounted state is not a private config copy\n"
+
+
+def login_shell(script):
+    import fcntl
+    import pty
+    import termios
+
+    master, slave = pty.openpty()
+    try:
+        def terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        result = subprocess.run(["zsh", "-lic", script], stdin=slave,
+                                capture_output=True, text=True, timeout=30,
+                                preexec_fn=terminal)
+    finally:
+        os.close(slave)
+        os.close(master)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not result.stderr, f"interactive login shell startup errors: {result.stderr}"
+
+
+def mounted(path):
+    # virtiofs is not guaranteed to change st_dev for nested host mounts.
+    encoded = str(path).replace("\\", "\\134").replace(" ", "\\040").replace("\t", "\\011")
+    return path.is_mount() or any(line.split()[4] == encoded for line in Path("/proc/self/mountinfo").read_text().splitlines())
+
+
+def structure():
+    assert not mounted(HOME) and not (HOME / "private-home-marker").exists(), "host HOME was mounted wholesale"
+    targets = MOUNTS[:3] if len(sys.argv) > 2 and sys.argv[2] == "default" else MOUNTS
+    for target in targets:
+        assert target.is_dir() and not target.is_symlink() and mounted(target), f"missing native mount: {target}"
+        assert (target / "mount-marker").read_text() == MARKER
+        assert not (target / "fixture-marker").exists(), "configuration snapshot was merged into mounted state"
+        assert stat.S_IMODE((target / "mount-marker").stat().st_mode) == 0o666, "seeder chmodded RW state"
+        assert stat.S_IMODE(target.stat().st_mode) == 0o777, "seeder chmodded RW mountpoint"
+    for root in (HOME / ".pi", HOME / ".omp"):
+        for directory, names, files in os.walk(root, followlinks=False):
+            current = Path(directory)
+            names[:] = [name for name in names if current / name not in MOUNTS]
+            assert not current.is_symlink() and stat.S_IMODE(current.stat().st_mode) == 0o700
+            for name in [*names, *files]:
+                item = current / name
+                assert not item.is_symlink(), "symlink copied into private configuration"
+                if item.is_file():
+                    assert stat.S_IMODE(item.stat().st_mode) in (0o600, 0o700)
+    for root in ROOTS:
+        for name in ("history.db", "terminal-sessions"):
+            assert not mounted(root / name), "runtime/index directory shared with host"
+    assert not mounted(HOME / ".omp/run"), "run leases shared with host"
+
+
+def policy():
+    actual = json.loads((ROOTS[0] / "sandbox.json").read_text())["filesystem"]
+    assert {str(HOME / ".pi"), str(HOME / ".omp"), "/root/.pi-host", "/root/.omp-host"} \
+        <= set(actual["denyRead"]), "private credentials or RO source paths are not protected"
+    assert {".", str(HOME / ".npm"), str(HOME / ".cache"),
+            str(HOME / ".local/share"), str(HOME / ".config")} <= set(actual["allowWrite"])
+    assert {".env", ".env.*", "*.pem", "*.key"} <= set(actual["denyWrite"])
+
+
+def png():
+    # A valid deterministic image above omp's 1024-base64-character blob
+    # threshold; no Pillow, host interpreter, or model service is required.
+    def chunk(kind, payload):
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload))
+    pixels = bytes((index * 37 + index // 11) % 256 for index in range(64 * 64 * 3))
+    rows = b"".join(b"\0" + pixels[offset:offset + 192] for offset in range(0, len(pixels), 192))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 64, 64, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows, 0)) + chunk(b"IEND", b"")
+
+
+def bucket():
+    for root, prefix in ((Path(os.environ["TMPDIR"]), "-tmp"), (HOME, "-")):
+        try:
+            relative = str(CWD.relative_to(root))
+        except ValueError:
+            continue
+        encoded = re.sub(r"[/\\:]", "-", "" if relative == "." else relative)
+        return prefix + ("" if prefix.endswith("-") or not encoded else "-") + encoded
+    return "--" + re.sub(r"[/\\:]", "-", str(CWD).lstrip("/\\")) + "--"
+
+
+def entries(path):
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def turn(root, profile, mode, saved):
+    for name in ("history.db", "terminal-sessions"):
+        assert not (root / name).exists(), f"new environment inherited {name}"
+    requests, errors, image_digests = [], [], []
+    answer = f"fixture-answer-{mode}-{profile}"
+    previous = f"fixture-answer-{'fixture' if mode == 'resume' else 'resume'}-{profile}"
+
+    class Provider(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            try:
+                assert self.path == "/v1/chat/completions", "unexpected provider endpoint"
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                assert body["model"] == "fixture" and body["stream"] is True
+                messages = body["messages"]
+                (CWD / f"{mode}-{profile}-request.json").write_text(json.dumps(body))
+                serialized = json.dumps(messages)
+                assert f"fixture-prompt-{profile}" in serialized, "resume did not replay original user turn"
+                if mode != "fixture":
+                    assert previous in serialized, "resume did not replay last saved assistant turn"
+                urls = [
+                    part["image_url"]["url"] for message in messages
+                    if isinstance(message.get("content"), list)
+                    for part in message["content"] if part.get("type") == "image_url"
+                ]
+                assert urls, "saved image blob did not rehydrate"
+                incoming = [hashlib.sha256(base64.b64decode(url.split(",", 1)[1], validate=True)).hexdigest() for url in urls]
+                if saved:
+                    assert incoming == saved["images"], "resume changed or lost saved provider image data"
+                image_digests.extend(incoming)
+                assert "blob:sha256:" not in serialized, "unresolved blob sent to provider"
+                requests.append(body)
+                chunks = [
+                    {"index": 0, "delta": {"role": "assistant", "content": answer}, "finish_reason": None},
+                    {"index": 0, "delta": {}, "finish_reason": "stop"},
+                ]
+                payload = "".join("data: " + json.dumps({"id": "fixture", "object": "chat.completion.chunk", "model": "fixture", "choices": [choice]}) + "\n\n" for choice in chunks) + "data: [DONE]\n\n"
+                payload = payload.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as error:
+                errors.append(str(error))
+                self.send_error(400, "synthetic provider assertion failed")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    model = {"id": "fixture", "name": "Fixture", "api": "openai-completions", "reasoning": False,
+             "input": ["text", "image"], "contextWindow": 128000, "maxTokens": 256,
+             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+             "compat": {"stripImageInput": False}}
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.yml").write_text(json.dumps({"images": {"autoResize": False, "blockImages": False}}))
+    # No host index is supplied. Start with a genuinely empty, VM-private
+    # SQLite database, so continue/id resolution must discover JSONL itself.
+    import sqlite3
+    fresh = sqlite3.connect(root / "history.db")
+    try:
+        fresh.execute("VACUUM")
+        assert fresh.execute("SELECT name FROM sqlite_master").fetchall() == []
+    finally:
+        fresh.close()
+    (root / "models.yml").write_text(json.dumps({"providers": {"fixture": {
+        "baseUrl": f"http://127.0.0.1:{server.server_port}/v1", "api": "openai-completions",
+        "apiKey": "fixture-key", "models": [model]}}}))
+    command = ["omp", "-p", "--model", "fixture/fixture", "--api-key", "fixture-key",
+               "--no-title", "--no-tools", "--no-lsp", "--no-extensions", "--no-skills", "--no-rules",
+               "--thinking", "off", "--system-prompt", "Reply with the synthetic provider response."]
+    if profile == "work":
+        command += ["--profile", "work"]
+    if mode == "fixture":
+        command += [f"@{CWD / 'fixture-image.png'}", f"fixture-prompt-{profile}"]
+    else:
+        command += (["--resume", saved["id"]] if mode == "resume" and profile == "work" else ["--continue"])
+        command += [f"fixture-next-{mode}-{profile}"]
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+                                env={**os.environ, "PI_NO_TITLE": "1"})
+    except subprocess.TimeoutExpired as error:
+        def decoded(value):
+            return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
+        (CWD / f"{mode}-{profile}-cli.log").write_text(decoded(error.stdout) + decoded(error.stderr))
+        (CWD / f"{mode}-{profile}-provider.json").write_text(json.dumps({
+            "requestCount": len(requests), "errors": errors,
+        }))
+        raise
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    (CWD / f"{mode}-{profile}-cli.log").write_text(result.stdout + result.stderr)
+    assert not errors, errors
+    assert result.returncode == 0 and answer in result.stdout, "actual omp CLI turn failed (see synthetic CLI log)"
+    assert len(requests) == 1, "unexpected extra model requests"
+    files = list((root / "sessions").glob("*/*.jsonl"))
+    assert len(files) == 1, "omp wrote outside native bucket or mixed profile histories"
+    session = files[0]
+    assert session.parent.name == bucket(), "native omp project bucket mismatch"
+    content = entries(session)
+    header = next(entry for entry in content if entry["type"] == "session")
+    assert header["cwd"] == str(CWD)
+    assert answer in session.read_text()
+    if saved:
+        assert str(session) == saved["path"] and header["id"] == saved["id"], "resume relocated/forked the original session"
+    refs = re.findall(r"blob:sha256:([0-9a-f]{64})", session.read_text())
+    assert refs, "actual image-bearing turn did not produce a blob reference"
+    blobs = [root / "blobs" / digest for digest in set(refs)]
+    assert all(blob.is_file() and hashlib.sha256(blob.read_bytes()).hexdigest() == blob.name for blob in blobs)
+    assert set(image_digests) <= {blob.name for blob in blobs}, "provider image is missing from persisted blobs"
+    artifact = session.with_suffix("") / "local" / "fixture-artifact.txt"
+    if mode == "fixture":
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(f"fixture-artifact-{profile}\n")
+    assert artifact.read_text() == f"fixture-artifact-{profile}\n", "omp same-basename artifacts disappeared"
+    assert (root / "history.db").is_file() and not mounted(root / "history.db"), "fresh omp index is not private"
+    return {"path": str(session), "id": header["id"], "artifact": str(artifact), "blobs": [str(blob) for blob in blobs], "images": image_digests}
+
+
+def sessions(mode):
+    assert HOME == Path(os.environ["PI_VERIFY_HOME"]) and Path(os.environ["TMPDIR"]) == Path(os.environ["PI_VERIFY_TMPDIR"])
+    assert CWD == Path(os.environ["PI_VERIFY_WORKSPACE"]) and str(CWD) != "/workspace"
+    old = json.loads(PROOF.read_text()) if mode != "fixture" else {}
+    image = png()
+    (CWD / "fixture-image.png").write_bytes(image)
+    command = ["node", "/verify/pi-sessions.mjs", mode]
+    if old:
+        command.append(old["pi"]["path"])
+    pi = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+    proof = {"pi": json.loads(pi.stdout)}
+    for root, profile in zip(ROOTS[1:], ("omp", "work")):
+        proof[profile] = turn(root, profile, mode, old.get(profile))
+    assert len({proof[name]["path"] for name in ("pi", "omp", "work")}) == 3
+    PROOF.write_text(json.dumps(proof))
+    if mode == "fixture":
+        paths = [proof["pi"]["path"], proof["pi"]["parent"]]
+        for profile in ("omp", "work"):
+            paths += [proof[profile]["path"], proof[profile]["artifact"], *proof[profile]["blobs"]]
+        (CWD / "live-paths").write_text("".join(path + "\n" for path in paths))
+        (CWD / "live-ready").write_text("actual agent writes complete\n")
+        deadline = time.monotonic() + 45
+        while not (CWD / "host-observed").exists():
+            assert time.monotonic() < deadline, "host did not observe writes while VM was running"
+            time.sleep(0.1)
+    if mode == "host":
+        (CWD / "assertions").write_text("PASS: host-equivalent native discovery/continue replays VM turns and images without seeding or shared SQLite\n")
+        (CWD / "completed").write_text("host-complete\n")
+
+
+try:
+    operation = sys.argv[1]
+    if operation == "structure":
+        structure()
+    elif operation == "policy":
+        policy()
+    elif operation == "shell":
+        login_shell(sys.argv[2])
+    else:
+        sessions(operation)
+except Exception:
+    (CWD / "failure").write_text("FAIL: session API/native state regression (see synthetic boot log)\n")
+    raise
+SESSIONS
+
 cat > "$TMP/control/checks.zsh" <<'GUEST'
 set -eu
 setopt PIPE_FAIL
-fail() { print -r -- "FAIL: $1" > /workspace/failure; exit 1; }
-pass() { print -r -- "PASS: $1" >> /workspace/assertions; }
-trap 'print -r -- "FAIL: guest assertion or command failed" > /workspace/failure' ZERR
+workspace="$PWD"
+fail() { print -r -- "FAIL: $1" > "$workspace/failure"; exit 1; }
+pass() { print -r -- "PASS: $1" >> "$workspace/assertions"; }
+trap 'print -r -- "FAIL: guest assertion or command failed" > "$workspace/failure"' ZERR
 mode="$1"
-/usr/bin/python3 /verify/network-fixtures.py workload >> /workspace/assertions \
+/usr/bin/python3 /verify/network-fixtures.py workload >> "$workspace/assertions" \
     || fail 'network filter proof or capability-drop contract failed'
-[[ ${+PI_CODING_AGENT_DIR} == 0 ]] || fail 'global PI_CODING_AGENT_DIR is set'
-[[ "$HOME" == /root ]] || fail 'unexpected native config home'
-[[ -d /root/.pi/agent && -d /root/.omp/agent ]] || fail 'native agent directories missing'
-[[ ! -L /root/.pi && ! -L /root/.omp && ! -e /root/.pi-agent ]] || fail 'config roots are not separate native directories'
-cmp -s /opt/pi-sandbox/sandbox.json.autonomous /root/.pi/agent/sandbox.json \
-    || fail 'Pi autonomous sandbox profile missing or changed'
-[[ ! -e /root/.omp/agent/sandbox.json ]] || fail 'Pi sandbox profile leaked into omp config'
-pass "$mode: native independent config paths and Pi sandbox profile"
+[[ ${+PI_CODING_AGENT_DIR} == 0 && ${+PI_CODING_AGENT_SESSION_DIR} == 0 ]] \
+    || fail 'global agent/session directory override is set'
+[[ "$HOME" == "$PI_VERIFY_HOME" && "$TMPDIR" == "$PI_VERIFY_TMPDIR" ]] \
+    || fail 'canonical HOME or TMPDIR was not mirrored'
+[[ "$PWD" == "$PI_VERIFY_WORKSPACE" && "$PWD" != /workspace ]] || fail 'canonical workspace was not mirrored'
+[[ "$PI_SANDBOX_PERSIST_SESSIONS" == 1 ]] || fail 'persistent session boot flag missing'
+[[ -d "$HOME/.pi/agent" && -d "$HOME/.omp/agent" ]] || fail 'native agent directories missing'
+[[ ! -L "$HOME/.pi" && ! -L "$HOME/.omp" && ! -e "$HOME/.pi-agent" ]] || fail 'config roots are not separate native directories'
+/usr/bin/python3 /verify/sessions.py policy || fail 'Pi autonomous sandbox policy missing or changed'
+[[ ! -e "$HOME/.omp/agent/sandbox.json" ]] || fail 'Pi sandbox profile leaked into omp config'
+pass "$mode: mirrored HOME, TMPDIR, cwd and independent native config paths"
 
-# Check before agent commands have a chance to create their own new files.
-for root in /root/.pi /root/.omp; do
-    [[ -z "$(find "$root" -type l -print -quit)" ]] || fail 'symlink copied into private config'
-    [[ -z "$(find "$root" -type d ! -perm 0700 -print -quit)" ]] || fail 'copied directory permissions are not private 0700'
-    [[ -z "$(find "$root" -type f ! -perm 0600 ! -perm 0700 -print -quit)" ]] || fail 'copied file permissions are not private 0600 or 0700'
-done
-pass "$mode: private config permissions and no copied symlinks"
+# Mounted state retains its original modes; only private config is hardened.
+/usr/bin/python3 /verify/sessions.py structure "$mode" || fail 'native state mounts or private config permissions failed'
+pass "$mode: exact RW state mounts preserve contents and modes; private config has no symlinks"
 
-if [[ "$mode" == fixture ]]; then
+if [[ "$mode" != default ]]; then
     /usr/bin/python3 /verify/sqlite-fixtures.py check \
         || fail 'SQLite backup omitted committed WAL data, copied sidecars, or failed quick_check'
     pass 'fixture: private SQLite snapshots include committed WAL data and pass quick_check'
     for agent in pi omp; do
-        root="/root/.$agent"
+        root="$HOME/.$agent"
         src="/root/.$agent-host"
         [[ "$(< "$root/config-origin.json")" == "{\"origin\":\"$agent-root\"}" ]] || fail 'same-named root config was merged or lost'
         [[ "$(< "$root/agent/config-origin.json")" == "{\"origin\":\"$agent-agent\"}" ]] || fail 'same-named agent config was merged or lost'
@@ -488,7 +840,8 @@ if [[ "$mode" == fixture ]]; then
         [[ "$(stat -c %a "$root/root-config.txt")" == 600 ]] || fail 'copied ordinary file is not private 0600'
         for level in "$root" "$root/agent" "$root/agent/extensions/nested"; do
             for excluded in sessions terminal-sessions cache caches logs bin __pycache__ .git history.db history.db-wal history.db-shm history.db.backup trust.json trust.db trust.db-wal fixture.db-wal fixture.db-shm .seeded; do
-                [[ ! -e "$level/$excluded" && ! -L "$level/$excluded" ]] || fail 'host history, binaries, cache, or trust copied'
+                [[ "$level/$excluded" == "$root/agent/sessions" ]] && continue
+                [[ ! -e "$level/$excluded" && ! -L "$level/$excluded" ]] || fail 'non-mounted host history, binaries, cache, or trust copied'
             done
         done
         for link in "$root/symlink-file" "$root/symlink-directory" "$root/broken-symlink" "$root/agent/relative-symlink-file" "$root/agent/relative-symlink-directory"; do
@@ -515,35 +868,36 @@ if [[ "$mode" == fixture ]]; then
         fi
     done
     pass 'fixture: same-named Pi and omp config, root files, and named profiles stay separate'
-    pass 'fixture: histories, host binaries, caches, trust, and symlinks omitted'
+    pass 'fixture: only native mounted sessions survive; arbitrary nested sessions and private runtime state omitted'
     pass "$mode: host runtime trees omitted while portable extension run directories survive"
     pass "$mode: source mounts reject writes and metadata changes, including after remount attempts"
     # Nested login shells remain supported; privileged nested bubblewrap does
     # not, because restoring NET_ADMIN/SYS_ADMIN would undermine the filter.
 
     for agent in pi omp; do
-        print -r -- '{"origin":"vm-edit"}' > "/root/.$agent/config-origin.json"
-        print -r -- '{"origin":"vm-edit"}' > "/root/.$agent/agent/config-origin.json"
-        touch -t 200001010000 "/root/.$agent/config-origin.json" "/root/.$agent/agent/config-origin.json"
-        rm "/root/.$agent/agent/deletable.txt"
+        print -r -- '{"origin":"vm-edit"}' > "$HOME/.$agent/config-origin.json"
+        print -r -- '{"origin":"vm-edit"}' > "$HOME/.$agent/agent/config-origin.json"
+        touch -t 200001010000 "$HOME/.$agent/config-origin.json" "$HOME/.$agent/agent/config-origin.json"
+        rm "$HOME/.$agent/agent/deletable.txt"
     done
-    print '' >> /root/.pi/agent/sandbox.json
-    cp /root/.pi/agent/sandbox.json /workspace/edited-sandbox.json
-    zsh -l -c '
+    print '' >> "$HOME/.pi/agent/sandbox.json"
+    cp "$HOME/.pi/agent/sandbox.json" "$workspace/edited-sandbox.json"
+    /usr/bin/python3 /verify/sessions.py shell '
         set -eu
         [[ ${+PI_CODING_AGENT_DIR} == 0 ]]
+        uv --version >/dev/null
         for agent in pi omp; do
-            [[ "$(< /root/.$agent/config-origin.json)" == "{\"origin\":\"vm-edit\"}" ]]
-            [[ "$(< /root/.$agent/agent/config-origin.json)" == "{\"origin\":\"vm-edit\"}" ]]
-            [[ ! -e /root/.$agent/agent/deletable.txt ]]
+            [[ "$(< "$HOME/.$agent/config-origin.json")" == "{\"origin\":\"vm-edit\"}" ]]
+            [[ "$(< "$HOME/.$agent/agent/config-origin.json")" == "{\"origin\":\"vm-edit\"}" ]]
+            [[ ! -e "$HOME/.$agent/agent/deletable.txt" ]]
         done
-        cmp -s /root/.pi/agent/sandbox.json /workspace/edited-sandbox.json
-    ' || fail 'nested login zsh reseeded config or replaced VM edits'
-    pass 'fixture: nested login zsh preserves edits, deletions, and sandbox profile'
+        cmp -s "$HOME/.pi/agent/sandbox.json" "$PWD/edited-sandbox.json"
+    ' || fail 'interactive login zsh failed or changed private config'
+    pass 'fixture: clean interactive login zsh finds image tools and preserves VM edits'
 else
-    [[ ! -e /root/.pi/config-origin.json && ! -e /root/.omp/config-origin.json ]] || fail 'unmounted boot retained fixture config'
-    print -r -- synthetic > /root/.pi/agent/default-write-probe
-    print -r -- synthetic > /root/.omp/agent/default-write-probe
+    [[ ! -e "$HOME/.pi/config-origin.json" && ! -e "$HOME/.omp/config-origin.json" ]] || fail 'unmounted boot retained fixture config'
+    print -r -- synthetic > "$HOME/.pi/agent/default-write-probe"
+    print -r -- synthetic > "$HOME/.omp/agent/default-write-probe"
     pass 'default: boot without host config mounts provides writable native config'
     /usr/bin/python3 /verify/sqlite-fixtures.py stress \
         || fail 'configuration snapshot cannot finish consistently under ongoing host writes'
@@ -553,26 +907,78 @@ fi
 for agent in pi omp; do
     command -v "$agent" >/dev/null || fail "$agent command is missing"
     version="$(timeout 30 "$agent" --version 2>/dev/null)" || fail "$agent --version failed"
-    [[ "$version" == *[0-9]* ]] || fail "$agent --version did not return a version"
+    case "$agent:$version" in
+        pi:*0.85.1*|omp:*18.12.6*) ;;
+        *) fail "$agent does not match the pinned verifier API version" ;;
+    esac
 done
 pass "$mode: actual pi --version and omp --version succeed"
-print -r -- "$mode-complete" > /workspace/completed
+if [[ "$mode" == fixture || "$mode" == resume ]]; then
+    /usr/bin/python3 /verify/sessions.py "$mode" || fail 'real-agent session persistence or resume failed'
+    pass "$mode: real Pi and omp default/profile sessions use native buckets, artifacts and image blobs"
+fi
+print -r -- "$mode-complete" > "$workspace/completed"
 GUEST
 
 run_guest() {
-    local mode="$1" workspace="$2" result=0 detail
+    local mode="$1" workspace="$2" result=0 detail vm_pid attempt ready=0 path
     shift 2
     local args=(machine run --unprivileged --net-backend virtio-net
-        --smolfile "$TMP/Smolfile" --no-init-cache --timeout 120s --mem 2048 --cpus 2)
-    # No SSH agent, API keys, real home mounts, or writable repository mount.
-    # Only local synthetic peer requests are needed; no external servers.
-    # smolvm versions differ on command overrides: explicitly invoke the shipped
-    # entrypoint so these checks cannot accidentally bypass configuration seeding.
+        --smolfile "$TMP/Smolfile" --no-init-cache --timeout 240s --mem 2048 --cpus 2
+        --workdir "$workspace" --env "HOME=$HOST_HOME" --env "TMPDIR=$HOST_TMPDIR"
+        --env "PI_VERIFY_HOME=$HOST_HOME" --env "PI_VERIFY_TMPDIR=$HOST_TMPDIR"
+        --env "PI_VERIFY_WORKSPACE=$workspace" --env PI_SANDBOX_PERSIST_SESSIONS=1)
+    local state
+    for state in .pi/agent/sessions .omp/agent/sessions .omp/agent/blobs \
+        .omp/profiles/work/agent/sessions .omp/profiles/work/agent/blobs; do
+        [[ "$mode" == default && "$state" == .omp/profiles/* ]] && continue
+        args+=(-v "$HOST_HOME/$state:$HOST_HOME/$state")
+    done
+    local command=(/usr/local/bin/pi-agent-seed.py zsh -l -c 'source /verify/checks.zsh "$1"' verify "$mode")
+    if [[ "$mode" == host ]]; then
+        # Same native namespace without seeding, snapshots or a shared index.
+        # The image supplies pinned agents; no host tool installation is needed.
+        command=(/usr/bin/setpriv --bounding-set=-all,+dac_override,+fowner
+            --inh-caps=-all --ambient-caps=-all --no-new-privs
+            /usr/bin/python3 /verify/sessions.py host)
+    fi
+    rm -f "$workspace/failure" "$workspace/completed" "$workspace/assertions" \
+        "$workspace/live-ready" "$workspace/host-observed"
     (cd "$TMP" && smolvm "${args[@]}" \
-        -v "$TMP/control:/verify:ro" -v "$workspace:/workspace" \
-        "$@" --image "$IMAGE_TAR" \
-        -- /usr/local/bin/pi-agent-seed.py zsh -l -c 'source /verify/checks.zsh "$1"' verify "$mode") \
-        > "$TMP/$mode-boot.log" 2>&1 || result=$?
+        -v "$TMP/control:/verify:ro" -v "$workspace:$workspace" \
+        "$@" --image "$IMAGE_TAR" -- "${command[@]}") \
+        > "$TMP/$mode-boot.log" 2>&1 &
+    vm_pid=$!
+    ACTIVE_VM="$vm_pid"
+    if [[ "$mode" == fixture ]]; then
+        # Wait after real agent writes, before VM exit: teardown-only copies
+        # cannot satisfy this host observation and guest acknowledgement.
+        for ((attempt = 0; attempt < 180; attempt++)); do
+            if [[ -f "$workspace/live-ready" ]]; then ready=1; break; fi
+            kill -0 "$vm_pid" 2>/dev/null || break
+            sleep 1
+        done
+        if [[ "$ready" == 1 ]]; then
+            [[ -s "$workspace/live-paths" ]] || fail 'guest omitted live native state paths'
+            while IFS= read -r path; do
+                [[ "$path" == "$HOST_HOME/"* && -s "$path" ]] \
+                    || fail 'live VM state is not readable at its native host path'
+                case "$path" in
+                    *.jsonl) grep -Eq 'fixture-pi-answer-fixture|fixture-answer-fixture-(omp|work)' "$path" \
+                        || fail 'host cannot read real saved agent turn while VM is live' ;;
+                    */blobs/*) [[ "$(shasum -a 256 "$path")" == "${path##*/} "* ]] \
+                        || fail 'host image blob does not match its content address while VM is live' ;;
+                    */local/fixture-artifact.txt) grep -Eq '^fixture-artifact-(omp|work)$' "$path" \
+                        || fail 'host artifact is missing while VM is live' ;;
+                    *) fail 'unexpected live fixture path' ;;
+                esac
+            done < "$workspace/live-paths"
+            printf 'host observed live transcripts, artifacts and blobs\n' > "$workspace/host-observed"
+            printf 'PASS: real-agent transcripts, artifacts and blobs are host-visible before VM exit\n'
+        fi
+    fi
+    wait "$vm_pid" || result=$?
+    ACTIVE_VM=""
     if [[ -f "$workspace/failure" ]]; then
         IFS= read -r detail < "$workspace/failure"
         case "$detail" in
@@ -590,11 +996,18 @@ run_guest() {
             *) fail "$mode: unexpected guest assertion output" ;;
         esac
     done < "$workspace/assertions"
+    [[ ! -e "$HOST_HOME/.omp/agent/history.db" \
+        && ! -e "$HOST_HOME/.omp/profiles/work/agent/history.db" ]] \
+        || fail 'VM history SQLite database leaked to host state'
 }
 
-run_guest fixture "$TMP/workspace" \
+run_guest fixture "$HOST_HOME/project" \
     -v "$TMP/fixtures/pi:/root/.pi-host:ro" \
     -v "$TMP/fixtures/omp:/root/.omp-host:ro"
+run_guest resume "$HOST_HOME/project" \
+    -v "$TMP/fixtures/pi:/root/.pi-host:ro" \
+    -v "$TMP/fixtures/omp:/root/.omp-host:ro"
+run_guest host "$HOST_HOME/project"
 run_guest default "$TMP/default-workspace"
 COPYFILE_DISABLE=1 tar -cf "$TMP/fixtures-after.tar" -C "$TMP/fixtures" pi omp
 cmp -s "$TMP/fixtures-before.tar" "$TMP/fixtures-after.tar" \

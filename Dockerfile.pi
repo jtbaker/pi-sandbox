@@ -1,5 +1,5 @@
 FROM node:24-slim
-LABEL io.pi-sandbox.config-layout="separate-v2"
+LABEL io.pi-sandbox.config-layout="separate-v3"
 
 # Install system utilities commonly needed by coding agents
 # bubblewrap + socat are required by the pi-sandbox extension for in-VM sandboxing
@@ -62,11 +62,11 @@ RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1
 # PI_CODING_AGENT_DIR override, which would merge their configuration.
 RUN curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v18.12.6
 
-# Set up the workspace mount point inside the VM
-WORKDIR /workspace
+# Prefix the existing theme prompt without changing its contents.
+RUN printf '\nPROMPT="🔒 $PROMPT"\n' >> /root/.zshrc
 
-# Allow git to operate on the mounted workspace (owned by host user, not root)
-RUN git config --global --add safe.directory /workspace
+# The launcher mounts and selects the host project's native absolute path.
+WORKDIR /
 
 # Start an interactive shell only after configuration seeding succeeds.
 ENTRYPOINT ["/usr/local/bin/pi-agent-seed.py"]

@@ -14,6 +14,8 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: pi-sandbox [options] [target_directory]"
             echo "Starts an interactive login shell inside an ephemeral smolvm microVM."
+            echo "Pi and omp sessions/attachments share normal host history and survive VM exit."
+            echo "Do not edit the same session from multiple host/VM processes at once."
             echo ""
             echo "Options:"
             echo "  --agent NAME        Startup hint: pi (default) or omp; does not launch it."
@@ -159,6 +161,91 @@ fi
 HOST_PI_DIR="$CANONICAL_PI_DIR"
 HOST_OMP_DIR="$CANONICAL_OMP_DIR"
 
+# Mirror native path identities without mounting HOME or the host temporary tree.
+HOST_TMP_PATH="${TMPDIR:-/tmp}"
+validate_mount_path "$HOST_TMP_PATH"
+if ! TMP_RESULT=$(realpath -- "$HOST_TMP_PATH" && printf '.'); then
+    echo "Error: could not canonicalize TMPDIR." >&2
+    exit 1
+fi
+HOST_TMPDIR="${TMP_RESULT%$'\n'.}"
+validate_mount_path "$HOST_TMPDIR"
+if [[ ! -d "$HOST_TMPDIR" ]]; then
+    echo "Error: TMPDIR must be an existing directory." >&2
+    exit 1
+fi
+WORKSPACE_ALIAS=""
+if [[ "$TARGET_DIR" == /private/tmp/* ]]; then
+    ALIAS_PATH="${TARGET_DIR#/private}"
+    if ALIAS_RESULT=$(realpath -- "$ALIAS_PATH" 2>/dev/null && printf '.'); then
+        ALIAS_DIR="${ALIAS_RESULT%$'\n'.}"
+        validate_mount_path "$ALIAS_DIR"
+        if [[ "$ALIAS_DIR" == "$TARGET_DIR" ]]; then
+            WORKSPACE_ALIAS="$ALIAS_PATH"
+        fi
+    fi
+fi
+
+# Each writable state source has only real directory components beneath the
+# canonical config root. Never follow an agent/session/blob/profile symlink into
+# credentials or configuration, and never change existing state permissions.
+ensure_state_directory() {
+    local path="$1" result canonical
+    validate_mount_path "$path"
+    if [[ -L "$path" || ( -e "$path" && ! -d "$path" ) ]]; then
+        echo "Error: shared state paths must be real directories, not symlinks: $path" >&2
+        exit 1
+    fi
+    if [[ ! -d "$path" ]]; then
+        (umask 077; mkdir -m 700 -- "$path")
+    fi
+    if ! result=$(realpath -- "$path" && printf '.'); then
+        echo "Error: could not canonicalize shared state directory: $path" >&2
+        exit 1
+    fi
+    canonical="${result%$'\n'.}"
+    validate_mount_path "$canonical"
+    if [[ "$canonical" != "$path" ]]; then
+        echo "Error: shared state directory has an aliased parent: $path" >&2
+        exit 1
+    fi
+}
+
+STATE_MOUNTS=()
+add_agent_state() {
+    local source="$1" destination="$2" blobs="$3"
+    ensure_state_directory "$source"
+    ensure_state_directory "$source/sessions"
+    STATE_MOUNTS+=(-v "$source/sessions:$destination/sessions")
+    if [[ "$blobs" == true ]]; then
+        ensure_state_directory "$source/blobs"
+        STATE_MOUNTS+=(-v "$source/blobs:$destination/blobs")
+    fi
+}
+
+ensure_state_directory "$HOST_PI_DIR"
+ensure_state_directory "$HOST_OMP_DIR"
+add_agent_state "$HOST_PI_DIR/agent" "${HOST_HOME%/}/.pi/agent" false
+add_agent_state "$HOST_OMP_DIR/agent" "${HOST_HOME%/}/.omp/agent" true
+PROFILES_DIR="$HOST_OMP_DIR/profiles"
+if [[ -e "$PROFILES_DIR" || -L "$PROFILES_DIR" ]]; then
+    ensure_state_directory "$PROFILES_DIR"
+    for PROFILE_DIR in "$PROFILES_DIR"/* "$PROFILES_DIR"/.[!.]* "$PROFILES_DIR"/..?*; do
+        [[ -e "$PROFILE_DIR" || -L "$PROFILE_DIR" ]] || continue
+        [[ -d "$PROFILE_DIR" || -L "$PROFILE_DIR" ]] || continue
+        PROFILE_NAME="${PROFILE_DIR##*/}"
+        if [[ ! "$PROFILE_NAME" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ||
+              "$PROFILE_NAME" == *. || "$PROFILE_NAME" == default ||
+              "$PROFILE_NAME" =~ ^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$ ]]; then
+            echo "Error: invalid omp profile directory name: $PROFILE_NAME" >&2
+            exit 1
+        fi
+        ensure_state_directory "$PROFILE_DIR"
+        add_agent_state "$PROFILE_DIR/agent" \
+            "${HOST_HOME%/}/.omp/profiles/$PROFILE_NAME/agent" true
+    done
+fi
+
 SCRIPT_PATH=$(realpath -- "${BASH_SOURCE[0]}")
 REPO_DIR="${SCRIPT_PATH%/*}"
 SMOLFILE="$REPO_DIR/pi-sandbox.smolfile"
@@ -167,7 +254,12 @@ if [[ ! -f "$SMOLFILE" ]]; then
     exit 1
 fi
 SMOLVM_ARGS=(machine run -it --net --net-backend virtio-net --smolfile "$SMOLFILE" \
-    --no-init-cache --unprivileged --mem 2048 --cpus 4)
+    --no-init-cache --unprivileged --mem 2048 --cpus 4 \
+    --workdir "$TARGET_DIR" --env "HOME=$HOST_HOME" --env "TMPDIR=$HOST_TMPDIR" \
+    --env PI_SANDBOX_PERSIST_SESSIONS=1)
+if [[ -n "$WORKSPACE_ALIAS" ]]; then
+    SMOLVM_ARGS+=(--env "PI_SANDBOX_WORKSPACE_ALIAS=$WORKSPACE_ALIAS")
+fi
 if [[ -n "$DNS_SERVER" ]]; then
     SMOLVM_ARGS+=(--dns "$DNS_SERVER")
 fi
@@ -204,7 +296,7 @@ done
 CACHE_DIR="${HOST_HOME%/}/.cache/pi-sandbox"
 IMAGE_TAR="$CACHE_DIR/pi-sandbox.tar"
 IMAGE_ID_FILE="$CACHE_DIR/.image_id"
-mkdir -p "$HOST_PI_DIR" "$HOST_OMP_DIR" "$CACHE_DIR"
+mkdir -p "$CACHE_DIR"
 ARCH=$(uname -m)
 case "$ARCH" in
     x86_64) ARCH=amd64 ;;
@@ -220,7 +312,7 @@ fi
 # Reject images built for the old shared-directory/shell-seeder layout before
 # exporting or booting them. A fresh registry pull alone cannot update that code.
 LAYOUT_KEY="io.pi-sandbox.config-layout"
-LAYOUT_VERSION="separate-v2"
+LAYOUT_VERSION="separate-v3"
 if ! IMAGE_LAYOUT=$(docker image inspect --format "{{index .Config.Labels \"$LAYOUT_KEY\"}}" "$IMAGE_NAME"); then
     echo "Error: image is unavailable locally; PI_SANDBOX_IMAGE requires an existing local image." >&2
     exit 1
@@ -337,9 +429,11 @@ else
 fi
 
 echo "Mounting host directory: $TARGET_DIR"
-echo "Starting an interactive shell; run $AGENT when ready."
+echo "Starting an interactive shell; run $AGENT when ready. Sessions persist in normal host history."
+echo "Do not edit the same session from multiple host/VM processes at once."
 smolvm "${SMOLVM_ARGS[@]}" \
-    -v "$TARGET_DIR:/workspace" \
+    -v "$TARGET_DIR:$TARGET_DIR" \
+    "${STATE_MOUNTS[@]}" \
     -v "$HOST_PI_DIR:/root/.pi-host:ro" \
     -v "$HOST_OMP_DIR:/root/.omp-host:ro" \
     --image "$IMAGE_TAR" \
