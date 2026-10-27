@@ -5,19 +5,22 @@ set -euo pipefail
 CACHE_DIR="$HOME/.cache/pi-sandbox"
 IMAGE_TAR="$CACHE_DIR/pi-sandbox.tar"
 IMAGE_NAME="jasonbaker/pi-sandbox:latest"
-TARGET_ARG=""
+AGENT_ARG=""
 
 # Parse flags and arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
             echo "Usage: pi-sandbox [options] [target_directory]"
-            echo "Runs the pi.dev coding agent inside a secure smolvm microVM sandbox."
+            echo "Runs the pi.dev (or omp / oh-my-pi) coding agent inside a secure smolvm microVM sandbox."
             echo ""
             echo "Options:"
+            echo "  --agent NAME        Agent to run in the VM: pi (default) or omp (oh-my-pi)."
+            echo "                      Equivalent to AGENT=omp ./pi-sandbox.sh"
             echo "  -h, --help          Show this help message"
             echo ""
             echo "Environment Variables:"
+            echo "  AGENT               Agent to run: pi (default) or omp (--agent overrides)."
             echo "  LLM_BASE_URL        Custom LLM endpoint (e.g. http://localhost:8001/v1 for OMLX)"
             echo "                      When set, cloud API keys are not forwarded."
             echo "  ANTHROPIC_API_KEY   Anthropic API key (ignored if LLM_BASE_URL is set)"
@@ -26,6 +29,19 @@ while [[ $# -gt 0 ]]; do
             echo "Building and pushing the image (first time or after Dockerfile changes):"
             echo "  ./build.sh"
             exit 0
+            ;;
+        --agent)
+            AGENT_ARG="${2:-}"
+            if [[ "$AGENT_ARG" != "pi" && "$AGENT_ARG" != "omp" ]]; then
+                echo "Error: --agent must be 'pi' or 'omp'."
+                exit 1
+            fi
+            shift 2
+            ;;
+        -*)
+            echo "Error: unknown option: $1"
+            echo "Run 'pi-sandbox --help' for usage."
+            exit 1
             ;;
         *)
             TARGET_ARG="$1"
@@ -49,7 +65,8 @@ echo "Mounting host directory: $TARGET_DIR"
 # into an ephemeral VM-local agent dir at boot (see pi-agent-seed.sh in the
 # image), so VM runs get host login state/extensions without sharing files.
 HOST_PI_DIR="$HOME/.pi"
-mkdir -p "$HOST_PI_DIR"
+HOST_OMP_DIR="$HOME/.omp"
+mkdir -p "$HOST_PI_DIR" "$HOST_OMP_DIR"
 mkdir -p "$CACHE_DIR"
 
 # Ensure smolvm is installed
@@ -61,21 +78,49 @@ fi
 
 IMAGE_ID_FILE="$CACHE_DIR/.image_id"
 docker pull "$IMAGE_NAME"
-NEW_IMAGE_ID=$(docker inspect --format='{{.Id}}' "$IMAGE_NAME")
 
-if [[ -f "$IMAGE_ID_FILE" ]] && [[ -f "$IMAGE_TAR" ]]; then
-    OLD_IMAGE_ID=$(cat "$IMAGE_ID_FILE")
-    if [[ "$NEW_IMAGE_ID" == "$OLD_IMAGE_ID" ]]; then
-        echo "Using existing local image cache: $IMAGE_TAR"
-    else
-        echo "Image updated. Re-exporting $IMAGE_NAME..."
-        docker save "$IMAGE_NAME" -o "$IMAGE_TAR"
-        echo "$NEW_IMAGE_ID" > "$IMAGE_ID_FILE"
-    fi
+# Cache validity keys on the exported tar's content hash: a plain image-id
+# check can't work because `docker inspect .Id` is the manifest-list digest
+# and stays identical across pulls of a new push, so stale tars would be
+# served forever. The hash check catches a fresh push; the size floor catches
+# an index-only tar — what `docker save` of a multi-arch tag writes in a
+# containerd store (OrbStack, Docker Desktop): index metadata, no layer
+# blobs (~20KB vs hundreds of MB). That is the tar smolvm rejects at boot
+# with "file not found in tar"; rejecting it here turns that mystery boot
+# error into an automatic re-export.
+tar_is_complete() {
+    [[ -f "$IMAGE_TAR" ]] || return 1
+    local size
+    size=$(stat -f %z "$IMAGE_TAR" 2>/dev/null || stat -c %s "$IMAGE_TAR" 2>/dev/null || echo 0)
+    [[ "$size" -gt 1048576 ]]
+}
+
+NEW_IMAGE_ID=$(sha256sum "$IMAGE_TAR" 2>/dev/null | cut -d' ' -f1 || true)
+
+if [[ -f "$IMAGE_ID_FILE" ]] && [[ -f "$IMAGE_TAR" ]] && [[ "$NEW_IMAGE_ID" == "$(cat "$IMAGE_ID_FILE")" ]] && tar_is_complete; then
+    echo "Using existing local image cache: $IMAGE_TAR"
 else
-    echo "Pulling and exporting $IMAGE_NAME..."
+    # Docker Hub reports the manifest-list id, and in a containerd store
+    # (OrbStack, Docker Desktop) `docker save` of the default multi-arch
+    # view writes a tar of index references — no layer blobs — which smolvm
+    # rejects at boot ("file not found in tar"). So: save, check, and on
+    # failure pull the LOCAL platform explicitly before saving. A tag's
+    # id is the list digest regardless of which platform was pulled, so the
+    # single-platform tag must be deleted and re-pulled: that is what makes
+    # the save emit real blobs.
+    echo "Exporting $IMAGE_NAME..."
     docker save "$IMAGE_NAME" -o "$IMAGE_TAR"
-    echo "$NEW_IMAGE_ID" > "$IMAGE_ID_FILE"
+    if ! tar_is_complete; then
+        ARCH=$(uname -m); [[ "$ARCH" == x86_64 ]] && ARCH=amd64; [[ "$ARCH" == aarch64 ]] && ARCH=arm64
+        echo "Multi-arch save lacks layer blobs; pulling linux/$ARCH explicitly..."
+        docker image rm -f "$IMAGE_NAME" >/dev/null 2>&1 || true
+        docker pull --platform "linux/$ARCH" "$IMAGE_NAME" >/dev/null 2>&1 \
+            || { echo "Error: could not pull linux/$ARCH of $IMAGE_NAME"; exit 1; }
+        docker save "$IMAGE_NAME" -o "$IMAGE_TAR"
+        tar_is_complete \
+            || { echo "Error: exported tar still lacks layer blobs; check the docker store (containerd image store + multi-arch tag)."; exit 1; }
+    fi
+    sha256sum "$IMAGE_TAR" | cut -d" " -f1 > "$IMAGE_ID_FILE"
 fi
 
 # Notify about SSH agent (crucial for secure git inside the sandbox)
@@ -99,6 +144,12 @@ if [[ -n "$VM_LLM_URL" ]]; then
     echo "Using local LLM endpoint: $VM_LLM_URL"
 fi
 
+# Choose the agent inside the VM: pi (default) or omp (oh-my-pi). Both run
+# through the same login shell (the image ENTRYPOINT). .zshenv seeds the
+# agent dirs from the host mounts before either runs.
+# --agent overrides AGENT; the value was validated during arg parsing.
+AGENT="${AGENT_ARG:-${AGENT:-pi}}"
+
 # Run the ephemeral microVM sandbox from the local tar file
 smolvm machine run -it \
     --net \
@@ -107,9 +158,10 @@ smolvm machine run -it \
     --cpus 4 \
     -v "$TARGET_DIR:/workspace" \
     -v "$HOST_PI_DIR:/root/.pi-host:ro" \
+    -v "$HOST_OMP_DIR:/root/.omp-host:ro" \
     -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
     -e OPENAI_API_KEY="${OPENAI_API_KEY:-}" \
     -e OPENAI_BASE_URL="${VM_LLM_URL:-}" \
     -e LLM_BASE_URL="${VM_LLM_URL:-}" \
     --image "$IMAGE_TAR" \
-    -- zsh
+    -- zsh -l -c "exec $AGENT"
